@@ -270,7 +270,7 @@ does not inherit the parent's PR_SET_DEFERRED_SETPRIO setting.
 
 PR_SET_DEFERRED_SETPRIO setting is reset by execve(2). Only the effects of 
 priority change requests issued via DPRIO prior to execve(2) have an effect on 
-the loaded executable image, but new a image executed by the task does not 
+the loaded executable image, but a new image executed by the task does not 
 inherit PR_SET_DEFERRED_SETPRIO setting.
 
 When executing clone(2), fork(2) or execve(2) the kernel will check for a 
@@ -414,7 +414,7 @@ USER-LEVEL LIBRARY
 
 While it is possible for an application developer to use the DPRIO prctl and 
 ku_area interface directly, it is more convenient to utilize instead a 
-user-level library wrapper published in DPIO git that shields the developer 
+user-level library wrapper published in DPRIO git that shields the developer 
 from having to deal with low-level details and embodies boilerplate code. The 
 wrapper is published under dual-license terms and the developer is free to 
 choose between GPL2 and "use as you want" license covering both open-source and 
