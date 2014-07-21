@@ -1,0 +1,664 @@
+                                    DPRIO
+
+                           THE DEFERRED SET PRIORITY
+                              FACILITY FOR LINUX
+
+		       Sergey Oboguev <oboguev@yahoo.com>
+
+SUMMARY
+=======
+
+Applications relying on fine-grain parallelism may sometimes need to change 
+their threads priority at a very high rate, hundreds or even thousands of times 
+per typical scheduling timeslice. These are typically applications that have to 
+execute short or very short lock-holding critical or otherwise time-urgent 
+sections of code at a very high frequency and need to protect these sections 
+with "set priority" system calls, one "set priority" call to elevate current 
+thread priority before entering the critical or time-urgent section, followed 
+by another call to downgrade thread priority at the completion of the section. 
+Due to the high frequency of entering and leaving critical or time-urgent 
+sections, the cost of these "set priority" system calls may raise to a 
+noticeable part of an application's overall expended CPU time. Proposed 
+"deferred set priority" facility allows to largely eliminate the cost of these 
+system calls. Instead of executing a system call to elevate its thread 
+priority, an application simply writes its desired priority level to a 
+designated memory area in the userspace. When the kernel attempts to preempt 
+the thread, it first checks the content of this area, and if the application's 
+stated request to change its priority has been posted in the designated memory 
+area, the kernel will execute this request and alter the priority of the thread 
+being preempted before performing a rescheduling, and then make scheduling 
+decisions based on the new thread priority level thus implementing the priority 
+protection of the critical or time-urgent section desired by the application. 
+In a predominant number of cases however, an application will complete the 
+critical section before the end of the current timeslice and cancel or alter 
+the request held in the userspace area. Thus a vast majority of an 
+application's change priority requests will be handled and mutually cancelled 
+or coalesced within the userspace, at a very low overhead and without incurring 
+the cost of a system call, while maintaining safe preemption control. The cost 
+of an actual kernel-level "set priority" operation is incurred only if an 
+application is actually being preempted while inside the critical section, i.e. 
+typically at most once per scheduling timeslice instead of hundreds or 
+thousands "set priority" system calls in the same timeslice.
+
+RATIONALE
+=========
+
+There are two common basic kinds of situations calling for high-frequency 
+elevation of thread priority during short sections of code.
+
+One capability commonly needed by applications relying on fine-grained 
+parallelism is efficient control over thread preemption in order to avoid lock 
+holder preemption. A wide class of applications falls under this category, from 
+database engines to multiprocessor virtual machines to multimedia applications. 
+
+Primitives intended to counteract thread preemption would normally be used to 
+bracket critical sections within applications, with the purpose of preventing 
+the thread from being preempted while holding a resource lock. Preemption of a 
+resource holder can lead to a wide range of pathologies, such as other threads 
+piling up waiting for the preempted thread holding the lock. These blocked 
+threads may in their turn hold other locks, which can lead to an avalanche of 
+blocking in the system (convoying), resulting in drastically increased 
+processing latencies and waste of CPU resources due to context switching and 
+rescheduling overhead. Furthermore, if resource locks are implemented as 
+spinlocks or hybrid locks with "spin-then-block" behavior, blocked waiters will 
+spin, wastefully consuming CPU resources and hindering preempted lock holder to 
+complete its work and release the lock. Priority inversion is easy to occur in 
+this situation as well. 
+
+Yet, despite this situation being common, mainstream operating systems usually 
+do not offer efficient low-overhead mechanism for preemption control. Usually 
+the best they offer is a system call to change thread priority, but this call 
+requires a userspace/kernel context switch and in-kernel processing, which is 
+fine for applications with coarse-grained parallelism, but is expensive for 
+applications relying on fine-grain parallelism. By juxtaposition, mainstream 
+operating systems do provide efficient locking primitives that normally do not 
+require userspace/kernel context switching, such as the Linux futex or Windows 
+CRITICAL_SECTION, but they do not provide similarly efficient mechanisms for 
+priority protection of critical sections or other adequate preemption control 
+to match those locking primitives.
+
+Another kind of situation arises out of an application's need to control a 
+thread's priority for reasons unrelated to well-defined resource locking, but 
+rather to perform system-critical tasks, whether holding a lock or not. For 
+example, a multiprocessor virtual machine may call for the elevation of a 
+thread's priority while processing virtual device interrupts or inter-processor 
+interrupts, for reasons of timing issues not expressible via locking notation. 
+A virtual machine may also want to elevate a thread's priority while a guest OS 
+is inside its time-urgent section as expressed by the state of the virtual 
+processor and various guest OS indicators not reducible to locking. [*]
+
+    [*] Indeed, the proposal for the deferred set priority mechanism has been
+        conceived in the context of VAX multiprocessor virtual machine project,
+	which encounters extensively both kinds of the described situations.
+	See the discussion in "VAX MP: A multiprocessor VAX simulator // 
+	Technical Overview",  http://oboguev.net/vax_mp/VAX_MP.pdf ,
+	specifically sections "Mapping execution context model: virtual
+	processors to host system threads" (pp. 16-30) and "Retrospective on
+	the features of host OS desirable for SMP virtualization" 
+	(pp. 156-159).
+
+Time-urgent sections thus can be defined not only by lock states, but also by 
+other intra-application state variables.
+
+
+SOLUTION
+========
+
+The proposed solution is composed of two parts: a patch to the Linux kernel to 
+implement the deferred set priority facility, and a user-level library 
+simplifying the use of the facility and shielding an application from having to 
+bother about low-level details and implementing the boilerplate code likely to 
+be common and repetitive for all applications using the deferred set priority 
+mechanism. An application developer wishing to use DPRIO normally does not need 
+to bother about DPRIO prctl interface and userspace <-> kernel protocol 
+described in this section and would rather use the user-level library 
+presenting a very simple interface and shielding the developer from the 
+low-level details.
+
+The kernel part of DPRIO interface is exposed via prctl (2) with the option 
+PR_SET_DEFERRED_SETPRIO.
+
+PR_SET_DEFERRED_SETPRIO has two forms:  one to set up the use of deferred set 
+priority facility (hereafter, DPRIO) for the current thread, another to 
+terminate the use of DPRIO for the thread.
+
+The system call to set up the use of DPRIO for the thread takes the form
+
+    prctl(PR_SET_DEFERRED_SETPRIO,
+          dprio_ku_area_pp,
+          sched_attrs_pp,
+          sched_attrs_count,
+          0)
+
+The effect of this call is limited to the current thread only.
+
+sched_attr_pp is a pointer to an array of pointers to struct sched_attr. The 
+array size is specified by sched_attrs_count parameter. The array describes a 
+set of priorities (scheduling attributes) the thread intends to subsequently 
+request via DPRIO mechanism and must contain at least one entry per each 
+scheduling policy (SCHED_NORMAL, SCHED_RR etc.) that the application intends to 
+subsequently request via DPRIO. Application can specify multiple entries per 
+scheduling policy in the array, but only the entry with the highest ("best") 
+priority for the given scheduling policy really matters.  For each of the 
+scheduling policies listed in the array, prctl(PR_SET_DEFERRED_SETPRIO) will 
+determine the highest level of priority listed and verify whether the calling 
+thread is currently authorized to use this level of priority. If not, prctl 
+call will return error status. If yes, prctl(PR_SET_DEFERRED_SETPRIO) will 
+store inside the kernel a pre-authorization for the thread to subsequently 
+elevate to this level of priority via DPRIO. DPRIO will also allow the thread 
+to elevate to lower levels of priority within the same scheduling policy. The 
+following scheduling policies can be listed via sched_attr_pp and subsequently 
+used via DPRIO: SCHED_NORMAL, SCHED_IDLE, SCHED_BATCH, SCHED_RR and SCHED_FIFO. 
+SCHED_DEADLINE is not a meaningful policy for use cases that DPRIO is intended 
+for, and cannot be used with DPRIO. An attempt to specify  SCHED_DEADLINE in 
+sched_attr_pp will result in prctl(PR_SET_DEFERRED_SETPRIO) returning an error.
+
+More specifically, stored pre-authorization consists of:
+
+    (a) For each scheduling policy listed in sched_attrs_pp, the highest
+        priority level requested for this policy in sched_attrs_pp.
+
+    (b) A record of whether the caller had CAP_SYS_NICE capability (either
+        explicitly assigned as a capability or caller having effective id of
+	root) at the time of the call.
+
+If at any time after executing prctl(PR_SET_DEFERRED_SETPRIO) thread priority 
+limits are subsequently constrained with prlimit/setrlimit(RLIMIT_RTPRIO) or 
+prlimit/setrlimit(RLIMIT_NICE), new constraint will affect the stored 
+pre-authorization. DPRIO will not allow the thread to elevate its priority 
+above the new limits set by prlimit/setrlimit(RLIMIT_RTPRIO) and 
+prlimit/setrlimit(RLIMIT_NICE) regardless of the pre-authorization created at 
+the time of prctl(PR_SET_DEFERRED_SETPRIO), unless pre-authorization record 
+also indicates that the thread had CAP_SYS_NICE capability at the time of 
+calling PR_SET_DEFERRED_SETPRIO. This restriction is intended to let external 
+process management applications to clamp down the application's priority.
+
+Thus calling PR_SET_DEFERRED_SETPRIO creates a limited pre-authorization 
+context separate from the thread’s current security context and holding a 
+record of CAP_SYS_NICE setting for the thread of at the time of 
+PR_SET_DEFERRED_SETPRIO call. If the thread decides to subsequently downgrade 
+its current security context and does not want the code subsequent to this 
+point to be able to make use of CAP_SYS_NICE recorded in the DPRIO context, it 
+is responsible for shutting down the registered DPRIO as well. (Very much like 
+a privileged program downgrading its privileges will be responsible for 
+deciding which of the files opened by it while it had privileges must be closed 
+at this point or left open.)
+
+dprio_ku_area_pp is a pointer to u64 variable in the userspace, let us name the 
+latter dprio_ku_area_p. This latter variable must be aligned on u64 natural 
+boundary, i.e. on the 8-byte boundary. When the application wants to signal to 
+the kernel its desire to change the thread's priority, the application fills in 
+the desired priority settings and control data into struct dprio_ku_area 
+described below and stores the address of the prepared struct dprio_ku_area 
+into dprio_ku_area_p. Even though dprio_ku_area_p actually holds a pointer, it 
+is declared as u64, so the interface will be uniform regardless of the system's 
+bitness, and thus 32-bit applications could interoperate with 64-bit kernel. On 
+32-bit systems, the upper part of dprio_ku_area_p is left zero.
+
+prctl(PR_SET_DEFERRED_SETPRIO) stores the value of dprio_ku_area_pp inside the 
+kernel. When the kernel subsequently attempts to preempt the thread, it checks 
+the stored value of dprio_ku_area_pp, and if it not NULL, tries to fetch from 
+the userspace a u64 value pointed to by dprio_ku_area_pp, i.e. dprio_ku_area_p. 
+If the fetch attempt fails (either because dprio_ku_area_pp points to an 
+invalid memory or page has been paged out), the kernel ignores the DPRIO 
+setting and proceeds as if the thread was not set up for DPRIO. If the fetched 
+value of dprio_ku_area_p is NULL, there is no DPRIO request from the 
+application and the kernel proceeds with rescheduling. If the fetched value of 
+dprio_ku_area_p is not NULL, the kernel fetches struct dprio_ku_area pointed by 
+dprio_ku_area_p. This area has the following structure:
+
+    struct dprio_ku_area {
+    	    /*volatile*/ u32 resp;    	/* DPRIO_RESP_xxx */
+	    /*volatile*/ u32 error;	/* one of errno values */
+	    /*volatile*/ struct sched_attr sched_attr;
+    };
+
+If the new priority setting requested by the application in sched_attr field 
+fits within the pre-authorization stored for the thread during 
+prctl(PR_SET_DEFERRED_SETPRIO), the kernel will alter the thread's priority and 
+scheduling attributes to the new value requested in sched_attr.
+
+The kernel will try to store the success/error status of the operation in resp 
+and error fields and attempt to reset the value of dprio_ku_area_p to NULL. The 
+exact kernel<->userspace DPRIO communication protocol is described in a 
+separate section below.
+
+The system call to terminate the use of DPRIO for the thread takes the form
+
+    prctl(PR_SET_DEFERRED_SETPRIO, 0, 0, 0, 0)
+
+After executing this call, the kernel will clear any previously stored value of 
+dprio_ku_area_pp for the thread and will no longer attempt to check for DPRIO 
+requests for the thread. 
+
+It is crucial that the user of DPRIO facility remembers to detach from DPRIO 
+after stopping to use it and before relinquishing the ownership of memory areas 
+pointed by dprio_ku_area_pp and the pointer stored in dprio_ku_area_pp, as the 
+kernel will continue reading from and writing to these areas of memory until 
+DPRIO use is terminated either via prctl or thread termination. Therefore 
+relinquishing the ownership of these memory areas prior to terminating their 
+designation for DPRIO will likely result in (1) task memory corruption and (2) 
+the possibility of unintended task priority changes.
+
+Right before detaching the thread from the previously designated 
+dprio_ku_area_pp the kernel will make one last attempt to check for a pending 
+DPRIO request associated with the previous value of dprio_ku_area_pp and 
+process any currently pending DPRIO request pointed to by this value.
+
+Likewise, if the application calls 
+
+    prctl(PR_SET_DEFERRED_SETPRIO, dprio_ku_area_1_pp, ...)
+    . . . . .
+    prctl(PR_SET_DEFERRED_SETPRIO, dprio_ku_area_2_pp, ...)
+
+then right before switching over to dprio_ku_area_2_pp, the kernel will process 
+a pending DPRIO request pointed by dprio_ku_area_1_pp.
+
+DPRIO requests are handled both on voluntary and involuntary preemption of the 
+thread, i.e. if the thread has a DPRIO request posted, the request will be 
+handled when the thread is preempted by a higher-priority task or on a 
+round-robin basis, but also when the thread enters wait state, e.g. by calling 
+sleep(3) or trying to read from a socket with no data available or doing epoll 
+etc.
+
+PR_SET_DEFERRED_SETPRIO setting is per-thread and is not inherited by child 
+threads or processes created via clone(2) or fork(2). Only the effects of 
+priority change requests issued via DPRIO prior to clone(2) or fork(2) have an 
+effect on a child task or thread (as long as this is not restricted by 
+SCHED_RESET_ON_FORK or SCHED_FLAG_RESET_ON_FORK), but a child task or thread 
+does not inherit the parent's PR_SET_DEFERRED_SETPRIO setting.
+
+PR_SET_DEFERRED_SETPRIO setting is reset by execve(2). Only the effects of 
+priority change requests issued via DPRIO prior to execve(2) have an effect on 
+the loaded executable image, but new a image executed by the task does not 
+inherit PR_SET_DEFERRED_SETPRIO setting.
+
+When executing clone(2), fork(2) or execve(2) the kernel will check for a 
+pending DPRIO request and try to process it before executing the main syscall 
+body, so the effects of priority adjustment request posted via DPRIO will be 
+integrated in the outcome of the mentioned syscalls.
+
+When executing a DPRIO request, the kernel will try to merge 
+SCHED_FLAG_RESET_ON_FORK into the current task state, as follows.
+
+If the task does not have the SCHED_RESET_ON_FORK flag set, and the request 
+does have the SCHED_FLAG_RESET_ON_FORK flag set in sched_attr structure, the 
+kernel will set the SCHED_RESET_ON_FORK flag for the task.
+
+If the task already has the SCHED_RESET_ON_FORK flag set, but the request does 
+not have the SCHED_FLAG_RESET_ON_FORK flag set in sched_attr structure, the 
+task will retain the flag. 
+
+The resultant task's "reset on fork" flag state is the logical "OR" of the 
+preceding task's flag state and the SCHED_FLAG_RESET_ON_FORK flag state in the 
+request. If the flag in the request is not set, the kernel will not attempt to 
+reset the task's flag. This is intended to avoid the need for task privileges 
+checking during the execution of a DPRIO request (since clearing the "reset on 
+fork" flag is a privileged operation). The client of the user-level library 
+needs to take additional caution about the use of the SCHED_FLAG_RESET_ON_FORK 
+flag, as described in the below section for the user-level library.
+
+
+DPRIO USERSPACE <-> KERNEL PROTOCOL
+===================================
+
+Userspace-kernel dprio protocol is defined as follows:
+
+Userspace:
+
+    Select and fill-in dprio_ku_area:
+        Set @resp = DPRIO_RESP_NONE.
+        Set @sched_attr.
+
+    Set @dprio_ku_area_p to point struct dprio_ku_area.
+
+Kernel:
+
+    1) On task preemption attempt or at another processing point,
+       such as fork or exec, read @dprio_ku_area_p. If cannot
+       (e.g. @ dprio_ku_area_p inaccessible incl. page swapped
+       out), quit.
+       Note: will reattempt again on next preemption cycle.
+
+    2) If read-in value of @dprio_ku_area_p is 0, do nothing. Quit.
+
+    3) Set @resp = DPRIO_RESP_UNKNOWN.
+       If cannot (e.g. inaccessible), quit.
+
+    4) Set @dprio_ku_area_p = NULL.
+       If cannot (e.g. inaccessible), quit.
+       Note that in this case request handling will be reattempted on next
+       thread preemption cycle. Thus @resp value of DPRIO_RESP_UNKNOWN may
+       be transient and overwritten with DPRIO_RESP_OK or DPRIO_RESP_ERROR
+       if @dprio_ku_area_p is not reset to 0 by the kernel (or to 0 or to
+       the address of another dprio_ku_area by the userspace).
+
+    5) Read @sched_attr.
+       If cannot (e.g. inaccessible), quit.
+
+    6) Try to change task scheduling attributes in accordance with read-in
+       value of @sched_attr.
+
+    7) If successful, set @resp = DPRIO_RESP_OK and Quit.
+
+    8) If unsuccessful, set @error = appopriate errno-style value.
+       If cannot (e.g. @error inaccessible), quit.
+       Set @resp = DPRIO_RESP_ERROR.
+       If cannot (e.g. @resp inaccessible), quit.
+
+Explanation of possible @resp codes:
+
+DPRIO_RESP_NONE
+
+    Request has not been processed yet.
+
+DPRIO_RESP_OK
+
+    Request has been successfully processed.
+
+DPRIO_RESP_ERROR
+
+    Request has failed, @error has errno-style error code.
+
+DPRIO_RESP_UNKNOWN
+
+    Request processing has been attempted, but the outcome is unknown.
+    Request might have been successful or failed.
+    Current os-level thread priority becomes unknown.
+
+    @error field may be invalid.
+
+    This code is written to @resp at the start of request processing,
+    then @resp is changed to OK or ERR at the end of request processing
+    if dprio_ku_area and @cmd stay accessible for write.
+
+    This status code is never left visible to the userspace code in the
+    current thread if dprio_ku_area and @cmd are locked in memory and remain
+    properly accessible for read and write during request processing.
+
+    This status code might happen (i.e. stay visible to userspace code
+    in the current thread) if access to dprio_ku_area or @cmd is lost
+    during request processing, for example the page that contains the area
+    gets swapped out or the area is otherwise not fully accessible for
+    reading and writing.
+
+    If @error has value of DPRIO_RESP_UNKNOWN and @cmd is still pointing
+    to dprio_ku_area containing @error, it is possible for the request to
+    be reprocessed again at the next context switch and @error change to
+    DPRIO_RESP_OK or DPRIO_RESP_ERROR. To ensure @error does not change
+    under your feet, change @cmd to either NULL or address of another
+    dprio_ku_area distinct from one containing this @error.
+
+If userspace memory containing dprio_ku_area_p or struct dprio_ku_area gets 
+paged out, the kernel won't be able to process a pending DPRIO request or 
+report processing status back to the userspace. In practice, the probability of 
+this is exceedingly small since if the request is still pending, it must have 
+been posted by the application during the latest timeslice, and thus the 
+application must have touched those memory pages during this timeslice, 
+therefore they are extremely likely to still be resident.  The mainline use 
+case for DPRIO is to avoid performance degradation caused by problems like lock 
+holder preemption, or preemption of a thread in overall application-urgent 
+section. These use cases are tolerant to occasionally missing thread priority 
+elevation as long as it is very infrequent, and thus the total impact on the 
+performance is negligible due to very low incidence of such events. If the 
+application requires hard guarantees, it must lock pages holding 
+dprio_ku_area_p and struct dprio_ku_area in memory with mlock(2). The 
+user-level DPRIO library described below allocates and manages low-level 
+structures internally and provides a way for the caller to request the 
+structures to be locked in memory, as long as the caller has appropriate 
+resource limits (sufficient RLIMIT_MEMLOCK) or CAP_IPC_LOCK capability.
+
+
+USER-LEVEL LIBRARY
+==================
+
+While it is possible for an application developer to use the DPRIO prctl and 
+ku_area interface directly, it is more convenient to utilize instead a 
+user-level library wrapper published in DPIO git that shields the developer 
+from having to deal with low-level details and embodies boilerplate code. The 
+wrapper is published under dual-license terms and the developer is free to 
+choose between GPL2 and "use as you want" license covering both open-source and 
+private-source commercial and non-commercial applications.
+
+The description of how to use the DPRIO user-level library and other 
+explanations can be found in the header file "dprio.h" of the library. Use 
+examples can be found in the DPRIO test program "test.c".
+
+The library provides a set of very simple routines to define logical priority 
+levels and their mapping to OS-level scheduling attributes, to allocate 
+supporting per-thread structures holding dprio_ku_area and other low-level 
+data, and routines to get/set thread logical priority. Logical priority setting 
+will be cached in the userspace and propagated to the kernel only when actually 
+necessary. In the use cases DPRIO facility is intended for, most get/set 
+logical priority calls will be resolved within the userspace at a very low 
+overhead.
+
+Two caveats the client of the DPRIO library needs to be aware of are related to 
+the very nature of the DPRIO library as "caching" the thread priority setting 
+in the userspace:
+
+    (a) sched_getattr(2), sched_getparam(2) and sched_getscheduler(2) return 
+        current OS-level thread scheduling policy and priority setting for the
+	thread, that is very likely to be different from thread's current
+	logical priority cached in the userspace which, after all, is intended
+	in most cases not to be propagated to the kernel.
+
+    (b) DPRIO user-level library tracks the latest thread priority setting it 
+        propagated to the kernel and makes its caching behavior decision based
+	on the knowledge of this setting held inside the library. The library
+	assumes its knowledge accurately represents kernel-level thread priority
+	setting. Direct sched_setattr(2), sched_setparam(2) and
+	sched_setscheduler(2) executed for the application thread either by the
+	application itself or by an external process will invalidate this
+	knowledge. If such an invalidation happens, it is the responsibility of
+	the application to execute the library method 
+	dprio_setnow(pl, DPRIO_FORCE) to resync kernel-level thread priority
+	setting with the library-cached state and application's idea what the
+	thread's priority should be.
+
+The client of the user-level library must also be careful about 
+SCHED_RESET_ON_FORK flag, since in addition to issuing DPRIO requests the 
+library may invoke sched_setattr(2) directly, which will fail if priority level 
+descriptor passed to it does not have SCHED_FLAG_RESET_ON_FORK set. The library 
+tries to mitigate this issue by checking if SCHED_RESET_ON_FORK was set at the 
+time of thread initialization for the library, and if so merging 
+SCHED_FLAG_RESET_ON_FORK into subsequent requests to sched_setattr(2), however 
+if SCHED_RESET_ON_FORK is set after calling dprio_init_thread, then the library 
+caller is responsible for managing the state of SCHED_FLAG_RESET_ON_FORK in 
+definitions of logical priority levels.
+
+
+KERNEL BUILD CONFIGURATION
+==========================
+
+The DPRIO facility is included into the built kernel via build option 
+CONFIG_DEFERRED_SETPRIO. If this option is not enabled, 
+prctl(PR_SET_DEFERRED_SETPRIO) will return -1 with errno set to EINVAL.
+Build option CONFIG_DEBUG_DEFERRED_SETPRIO enables the debug code for DPRIO.
+The downside of using DPRIO is that it may slightly increase the rescheduling 
+latency in the case when DPRIO request for the task is pending and being 
+processed during the task's rescheduling time. Thus, a higher priority task may 
+be delayed from resuming its execution by the time it takes to process the 
+pending DPRIO request. This time on a typical x86 machine is around 1 usec, 
+possibly slightly longer if the rt_mutex priority inheritance chain needs to be 
+adjusted. This added delay is but a fraction of normal task rescheduling and 
+context switching time, and furthermore is incurred only when a DPRIO request 
+is actually pending, so in most cases it won't be significant, however in those 
+cases where it might be, DPRIO provides an authorization mechanism controlling 
+who is allowed to use the DPRIO facility.
+Two build options (only one of them is selectable at a time) define who is 
+initially authorized to use DPRIO facility. Selecting 
+CONFIG_DEFERRED_SETPRIO_ALLOW_EVERYBODY will initially permit every user on the 
+system to utilize DPRIO. Selecting DEFERRED_SETPRIO_ALLOW_NOBODY will initially 
+disallow all users on the system, except root, to utilize DPRIO.  These initial 
+settings are in effect right after system boot, however the setting can be 
+dynamically modified by specifying a DPRIO authorization list as described 
+below.
+
+DPRIO AUTHORIZATION LIST
+========================
+
+The list of users permitted to utilize the DPRIO facility can be dynamically 
+specified by writing the DPRIO authorization list to 
+/proc/sys/kernel/dprio_authlist. The list can also be read back from the file.
+
+If CONFIG_DEFERRED_SETPRIO_ALLOW_EVERYBODY is enabled, the list is initially 
+set to "everybody".
+
+If CONFIG_DEFERRED_SETPRIO_ALLOW_NOBODY is enabled, the list is initially set 
+to "nobody".
+
+The list is a sequence of whitespace-separated entries, each entry having one 
+of the following formats:
+
+    uid:<numeric-uid>
+    gid:<numeric-gid>
+    nouid:<numeric-uid>
+    nogid:<numeric-gid>
+    everybody
+    nobody
+
+For instance: "uid:47 uid:100 gid:12 nobody".
+Or: "nogid:300 everybody".
+
+Terminal entry must always be either "nobody" or "everybody".
+
+The task with current effective UID of root user (i.e. namespace-global root) 
+is always allowed to use DPRIO, even if the authorization list is set to 
+"nobody" or otherwise does not permit the task to use DPRIO.
+
+
+PRIOR ART
+=========
+
+There is a number of existing techniques and facilities intended to address 
+similar or partially similar problems that the deferred set priority mechanism 
+(DPRIO) is intended to address. This section briefly reviews these techniques 
+and facilities and compares them vs. DPRIO.
+
+Microsoft Windows tries to address the lock holder preemption issue by using 
+explicitly enlarged scheduling quantum in server editions, that (hopefully) 
+should allow a worker thread enough time to handle the request and release the 
+locks, and also reduces context switching overhead. Scheduling quantum can 
+likewise be increased in Linux to meet similar needs of the server systems. 
+However large scheduling quantum does not help applications that require longer 
+than a quantum to complete the processing and that acquire locks for short 
+intervals, many times per scheduling quantum whether the latter is short or 
+long. In fact, enlarged quantum may even aggravate the problem in this case by 
+preempting lock holder for a longer time.
+
+The PTHREADS specification defines priority protection (ceiling) associated 
+with locks, whereby a thread acquiring the lock will temporary have its 
+priority elevated for the duration of holding the lock, however when PTHREADS 
+is implemented as a user-level library, such as a part of GLIBC (which is 
+necessary for having user-space fast path at least for the locking part 
+itself),  the implementation of the priority protection feature has to rely on 
+existing priority control facilities exposed by the kernel to the userspace and 
+in the absence of DPRIO has to incur the cost of the system call every time a 
+thread priority adjustment is performed, i.e. typically both on entering and 
+leaving the critical section -- exactly what DPRIO is meant to avoid. 
+Ironically, the implementation of priority-protected PTHREADS primitives ends 
+up composed of two mismatching parts: low-overhead locking primitives that 
+complete most of the time in the userspace, without switching to the kernel, 
+and the priority protection part, which, in the absence of DPRIO means 
+utilizing regular "set thread priority" system calls with all the overhead of 
+userspace/kernel context switching and intra-kernel processing these calls 
+induce. DPRIO is meant to help eliminate this disbalance and provide a priority 
+control mechanism that would be an adequate match for low-overhead locking 
+primitives.
+
+Furthermore, not all PTHREADS implementations implement the priority protection 
+part of the specification correctly or even at all. For example, the GLIBC 
+implementation resets the priority of the thread leaving a mutex-protected 
+critical section to the maximum of the thread's pre-section priority and the 
+highest ceiling priority of any mutex still held, even though the thread may 
+want to retain higher priority at the exit from the critical section for 
+reasons unrelated to locking and has explicitly elevated the thread to this 
+priority. A part of this flaw arises from misreading the specification, but in 
+part it is due to the lack of sufficient emphasis in the specification itself 
+on application-wide control over thread priority integrating both lock states 
+and inputs unrelated to locking.
+
+As an alternative to priority protection, PTHREADS specification also provides 
+a priority inheritance protocol for the protection of locks, which in Linux is 
+implemented on top of priority inheritance futexes, ultimately laid on top of 
+an rt_mutex. Apart from the issues discussed e.g. in Yodaiken's article 
+("Against priority inheritance", FSMLabs, 2002) and responses to it, priority 
+inheritance may work satisfactory or at least as a "least worst" solution for 
+the cases covered by a PI model, but offers little for those that are not, such 
+as applications with non-trivial wait chains not expressed in locks structure, 
+or where they are expressed as such, not as host OS PI locks (but e.g. as guest 
+OS spinlocks or one VCPU spin-waiting for ack to IPI request sent to another 
+VCPU). A PI model also does not offer a solution for applications with parts 
+having soft RT properties and thus preemption by unrelated timesharing threads 
+while inside a time-urgent section of the application is undesirable. Such 
+applications have to fall back on priority protection based heuristics the 
+problems of which were discussed earlier in this section.
+
+Although the issue of inopportune preemption had been addressed in the research 
+early on [*], the only mainstream production operating systems that eventually 
+came to provide a form of low-overhead preemption control are Solaris and AIX. 
+Solaris schedctl facility provides functions schedctl_start() and 
+schedctl_stop() with a very efficient low-overhead implementation. When an 
+application wants to defer involuntary thread preemption, this thread calls 
+schedctl_start which stores a flag in the userspace/kernel communication memory 
+page accessible to the kernel but also mapped into user space. If the scheduler 
+sees this flag, it will try to honor it and give the thread extra time before 
+it is being preempted. The flag is strictly advisory, the kernel is under no 
+obligation to honor it, and indeed if the flag stays on for more than a couple 
+of ticks and the thread does not yield, the kernel will stop honoring this flag 
+until the thread yields. If the kernel considered a thread for a preemption, 
+but let it go on because of the "do not preempt me" flag, the kernel will set 
+the "preemption pending" flag in the user/kernel shared page. When the thread 
+has released the lock and calls schedctl_stop, the latter will reset the "do 
+not preempt me" flag and check for the "preemption pending" flag. If the latter 
+is set, the thread will yield voluntary. AIX provides a very similar facility.
+
+    [*] For the bibliography see e.g. "VAX MP Technical Overview", p. 157,
+        also pp. 16, 25.
+
+The Solaris schedctl is a useful mechanism, but has a number of obvious 
+limitations.
+
+First, it does not provide a way to associate a priority with the resource 
+whose lock is being held (or, more generally, with thread application-specific 
+logical state; see the footnote below). An application is likely to have a
+range of locks with different criticality levels and different needs for
+holder protection [*]. For some locks, holder preemption may be tolerated
+somewhat, while other locks are highly critical, furthermore for some lock
+holders preemption by a high-priority thread is acceptable but not a preemption
+by a low-priority thread. The Solaris/AIX schedctl does not provide a
+capability for priority ranging relative to the context of the whole 
+application and other processes in the system.
+
+    [*] We refer just to locks here for simplicity, but the need of a thread
+        for preemption control does not reduce to locks held alone, and may
+	result from other intra-application state conditions, such as executing
+	a time-urgent fragment of code in response to a high-priority event
+	(that may potentially be blocking for other threads) or other code
+	paths that can lead to wait chains unless completed promptly.
+
+Second, in some cases application may need to perform time-urgent processing 
+without knowing in advance how long it will take. In the majority of cases the 
+processing may be very short (a fraction of a scheduling timeslice), but 
+sometimes may take much longer (such as a fraction of a second). Since schedctl 
+would not be effective in the latter case, an application would have to resort 
+to system calls for thread priority control in all cases [*], even in the 
+majority of "short processing" cases, with all the overhead of this approach.
+
+    [*] Or introduce extra complexity, most likely very cumbersome, by trying
+        to gauge and monitor the accumulated duration of the processing, with
+	the intention to transition from schedctl to thread priority elevation
+	once a threshold has been reached.
+
+Finally, schedctl is strictly an advisory mechanism. The kernel is under no 
+obligation to honor it and the calling thread fundamentally still remains 
+low-priority thread preemptible by other low-priority compute bound threads. 
+Moreover, the kernel starts ignoring schedctl requests under heavy load, 
+exactly when the aid of schedctl is most needed.
+
+DPRIO offers an efficient facility addressing the needs of some use cases not 
+covered by the existing mechanisms, and can be used by applications both 
+directly, and also as an efficient underlying facility in the implementation of 
+PTHREADS priority protection and other higher-level synchronization primitives.
+

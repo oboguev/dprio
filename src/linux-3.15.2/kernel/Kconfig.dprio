@@ -1,0 +1,60 @@
+config DEFERRED_SETPRIO
+	bool "Enable deferred setting of task priority"
+	default n
+	help
+	  Enabling this option allows authorized applications to use
+	  PR_SET_DEFERRED_SETPRIO request in prctl system call.
+
+	  Applications that change task priority with very high frequency can
+	  benefit from using this facility as long as they are specifically
+	  implemented to use prctl(PR_SET_DEFERRED_SETPRIO). If the system does
+	  not intend to run such applications there is no benefit to using
+	  this option.
+
+	  The downside of selecting this option is slightly increased latency
+	  in task switching only in the case when a deferred set priority request
+	  by a previous task is pending at task switch time. Added delay in task
+	  context switch in this case is in the order of 1 usec (typical time for
+	  executing deferred sched_setattr system call), which normally is not
+	  significant, but may be a consideration in a system intended for hard
+	  real-time use.
+
+	  If unsure, say N.
+
+config DEBUG_DEFERRED_SETPRIO
+	bool "Enable debugging code for deferred task priority setting"
+	depends on DEFERRED_SETPRIO
+	default n
+	help
+	  Enable debugging code for DEFERRED_SETPRIO.
+
+	  If unsure, say N.
+
+choice
+	prompt "Default authorization for deferred set priority"
+	depends on DEFERRED_SETPRIO
+	default DEFERRED_SETPRIO_ALLOW_NOBODY
+	help
+	  Select whether users on the system are allowed by default to use the
+	  deferred set priority facility. This setting defines the initial
+	  value for the authorization list (as "everybody" or "nobody") that
+	  can be altered dynamically via /proc/sys/kernel/dprio_authlist.
+
+config DEFERRED_SETPRIO_ALLOW_EVERYBODY
+	bool "Allow everybody to use the deferred set priority by default"
+	help
+	  Allow by default every user on the system to use the deferred set
+	  priority facility. Authorization list is initialized to "everybody"
+	  at system startup time but can be altered later dynamically via
+	  /proc/sys/kernel/dprio_authlist.
+
+config DEFERRED_SETPRIO_ALLOW_NOBODY
+	bool "Do not allow anybody to use the deferred set priority by default"
+	help
+	  Disallow by default every user on the system except superuser to use
+	  the deferred set priority facility. Authorization list is initialized
+	  to "nobody" at system startup time but can be altered later dynamically
+	  via /proc/sys/kernel/dprio_authlist.
+
+endchoice
+
