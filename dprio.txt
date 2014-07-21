@@ -174,7 +174,7 @@ calling PR_SET_DEFERRED_SETPRIO. This restriction is intended to let external
 process management applications to clamp down the application's priority.
 
 Thus calling PR_SET_DEFERRED_SETPRIO creates a limited pre-authorization 
-context separate from the thread’s current security context and holding a 
+context separate from the thread's current security context and holding a 
 record of CAP_SYS_NICE setting for the thread of at the time of 
 PR_SET_DEFERRED_SETPRIO call. If the thread decides to subsequently downgrade 
 its current security context and does not want the code subsequent to this 
