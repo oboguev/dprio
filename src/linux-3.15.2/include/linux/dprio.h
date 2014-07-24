@@ -19,10 +19,10 @@
 #ifdef CONFIG_DEFERRED_SETPRIO
 
 /*
- * @mask contains bit-flags indicating which policies had been pre-approved.
- * Other fields are valid only if the corresponding bit is set in @mask.
+ * @mask contains bit-flags indicating which policies have been pre-approved.
+ * Other fields are valid only if the corresponding bit is set in the @mask.
  */
-static inline void __dprio_info_assumptions(void)
+static __always_inline void __dprio_info_assumptions(void)
 {
 	/* SCHED_xxx is used as a bit index in @mask */
 	BUILD_BUG_ON(SCHED_NORMAL > 31);

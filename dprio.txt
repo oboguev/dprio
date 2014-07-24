@@ -115,7 +115,7 @@ described in this section and would rather use the user-level library
 presenting a very simple interface and shielding the developer from the 
 low-level details.
 
-The kernel part of DPRIO interface is exposed via prctl (2) with the option 
+The kernel part of DPRIO interface is exposed via prctl(2) with the option 
 PR_SET_DEFERRED_SETPRIO.
 
 PR_SET_DEFERRED_SETPRIO has two forms:  one to set up the use of deferred set 
@@ -474,7 +474,7 @@ KERNEL BUILD CONFIGURATION
 The DPRIO facility is included into the built kernel via build option 
 CONFIG_DEFERRED_SETPRIO. If this option is not enabled, 
 prctl(PR_SET_DEFERRED_SETPRIO) will return -1 with errno set to EINVAL.
-Build option CONFIG_DEBUG_DEFERRED_SETPRIO enables the debug code for DPRIO.
+
 The downside of using DPRIO is that it may slightly increase the rescheduling 
 latency in the case when DPRIO request for the task is pending and being 
 processed during the task's rescheduling time. Thus, a higher priority task may 
@@ -486,6 +486,7 @@ context switching time, and furthermore is incurred only when a DPRIO request
 is actually pending, so in most cases it won't be significant, however in those 
 cases where it might be, DPRIO provides an authorization mechanism controlling 
 who is allowed to use the DPRIO facility.
+
 Two build options (only one of them is selectable at a time) define who is 
 initially authorized to use DPRIO facility. Selecting 
 CONFIG_DEFERRED_SETPRIO_ALLOW_EVERYBODY will initially permit every user on the 
@@ -494,6 +495,34 @@ disallow all users on the system, except root, to utilize DPRIO.  These initial
 settings are in effect right after system boot, however the setting can be 
 dynamically modified by specifying a DPRIO authorization list as described 
 below.
+
+Build option CONFIG_PUT_TASK_TIMEBOUND ensures fast and deterministically
+time-bound task switch latency (as far as DPRIO impact is concerned) when a
+deferred set priority request is pending on a task rescheduling and the
+processing of this request causes an adjustment of priority inheritance chain
+under very low memory conditions (depleted atomic pool).
+
+Adjustment of priority inheritance chain may cause (albeit with low
+probability) a final release of task structure for some tasks that participated
+in the chain. When this codepath is executed within the context of task
+rescheduling, DPRIO patch tries to postpone the deallocation of those task
+structures and various elements of these structures by relegating the procedure
+to a system work thread instead of executing it from inside the scheduler.
+To relegate this work to a work thread, the kernel allocates a workqueue entry
+from an atomic pool, however under very low memory conditions this allocation
+may fail. If CONFIG option PUT_TASK_TIMEBOUND was selected as "no", then in
+the case of such wokrqueue element allocation failure the deallocation of task
+structure will be performed within the context of the scheduler. If however
+PUT_TASK_TIMEBOUND was selected as "yes", task structure deallocation path will
+use a workqueue entry embedded into a task structure itself. This ensures a
+workqueue entry is always available and thus task dealocation can always be
+relegated to a system work thread, however it costs about 20-40 bytes per
+every task in the system. Select PUT_TASK_TIMEBOUND as Y if building the kernel
+for hard real-time system requiring the determinism in latency in the task
+switch path. Select N for general-purpose desktop or server system.
+
+Build option CONFIG_DEBUG_DEFERRED_SETPRIO enables the debug code for DPRIO.
+
 
 DPRIO AUTHORIZATION LIST
 ========================

@@ -1,4 +1,4 @@
-config DEFERRED_SETPRIO
+menuconfig DEFERRED_SETPRIO
 	bool "Enable deferred setting of task priority"
 	default n
 	help
@@ -20,6 +20,26 @@ config DEFERRED_SETPRIO
 	  real-time use.
 
 	  If unsure, say N.
+
+if DEFERRED_SETPRIO
+
+config PUT_TASK_TIMEBOUND
+	bool "Deterministic task switch latency when deferred set task priority is used"
+	depends on DEFERRED_SETPRIO && RT_MUTEXES
+	default n
+	help
+	  Enabling this option ensures deterministic time-bound task switch
+	  latency when a deferred set priority request is pending on a task
+	  rescheduling and switch and the processing of this request causes
+	  an adjustment of priority inheritance chain under very low memory
+	  conditions (depleted atomic pool).
+
+	  Select Y if building the kernel for hard real-time system requiring
+	  the determinism in task switch latency. Select N for general-purpose
+	  desktop or server system.
+
+	  This option has memory cost of about 20-40 bytes per each running task
+	  in the system.
 
 config DEBUG_DEFERRED_SETPRIO
 	bool "Enable debugging code for deferred task priority setting"
@@ -58,3 +78,4 @@ config DEFERRED_SETPRIO_ALLOW_NOBODY
 
 endchoice
 
+endif # DEFERRED_SETPRIO

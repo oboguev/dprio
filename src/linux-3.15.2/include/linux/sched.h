@@ -1614,6 +1614,9 @@ struct task_struct {
 	struct dprio_ku_area __user * __user *dprio_ku_area_pp;
 	struct dprio_info *dprio_info;
 #endif
+#ifdef CONFIG_PUT_TASK_TIMEBOUND
+	struct work_struct put_task_work;
+#endif
 #ifdef CONFIG_DEBUG_DEFERRED_SETPRIO
 	bool in_dprio;
 #endif

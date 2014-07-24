@@ -251,18 +251,60 @@ static inline void __do_put_task_struct(struct task_struct *tsk)
 		free_task(tsk);
 }
 
-#ifdef CONFIG_DEFERRED_SETPRIO
+#ifdef CONFIG_PUT_TASK_TIMEBOUND
+/*
+ * If timebound, use preallocated struct work_struct always guaranteed
+ * to be available, even if atomic kmalloc pool is depleted.
+ */
+static inline struct work_struct *alloc_put_task_work(struct task_struct *tsk)
+{
+	return &tsk->put_task_work;
+}
+
+static inline void free_put_task_work(struct work_struct *work)
+{
+}
+
+static inline struct task_struct *put_task_work_tsk(struct work_struct *work)
+{
+	return container_of(work, struct task_struct, put_task_work);
+}
+#else
 struct put_task_work {
 	struct work_struct work;
 	struct task_struct *tsk;
 };
 
-static void __put_task_struct_work(struct work_struct *work)
+static inline struct work_struct *alloc_put_task_work(struct task_struct *tsk)
+{
+	struct put_task_work *dwork =
+		kmalloc(sizeof(*dwork), GFP_NOWAIT | __GFP_NOWARN);
+	if (unlikely(!dwork))
+		return NULL;
+	dwork->tsk = tsk;
+	return &dwork->work;
+}
+
+static inline void free_put_task_work(struct work_struct *work)
 {
 	struct put_task_work *dwork =
 		container_of(work, struct put_task_work, work);
-	__do_put_task_struct(dwork->tsk);
 	kfree(dwork);
+}
+
+static inline struct task_struct *put_task_work_tsk(struct work_struct *work)
+{
+	struct put_task_work *dwork =
+		container_of(work, struct put_task_work, work);
+	return dwork->tsk;
+}
+#endif
+
+#ifdef CONFIG_DEFERRED_SETPRIO
+static void __put_task_struct_work(struct work_struct *work)
+{
+	__do_put_task_struct(put_task_work_tsk(work));
+	free_put_task_work(work);
 }
 #endif
 
@@ -270,15 +312,13 @@ void __put_task_struct(struct task_struct *tsk)
 {
 #ifdef CONFIG_DEFERRED_SETPRIO
 	/*
-	 * When called from inside __schedule, try to defer processing to
-	 * a worker thread, in order to mininize the scheduling latency.
+	 * When called from inside of __schedule(), try to defer processing
+	 * to a worker thread, in order to mininize the scheduling latency
+	 * and make it deterministic.
 	 */
 	if (unlikely(preempt_count() & PREEMPT_ACTIVE)) {
-		struct put_task_work *dwork =
-			kmalloc(sizeof(*dwork), GFP_NOWAIT | __GFP_NOWARN);
-		if (dwork) {
-			struct work_struct *work = &dwork->work;
-			dwork->tsk = tsk;
+		struct work_struct *work = alloc_put_task_work(tsk);
+		if (likely(work)) {
 			INIT_WORK(work, __put_task_struct_work);
 			schedule_work(work);
 			return;

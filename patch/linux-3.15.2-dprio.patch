@@ -1,6 +1,6 @@
 diff -uprN linux-3.15.2/fs/exec.c linux-3.15.2-dprio/fs/exec.c
 --- linux-3.15.2/fs/exec.c	2014-06-26 12:17:52.000000000 -0700
-+++ linux-3.15.2-dprio/fs/exec.c	2014-07-21 04:07:23.000000000 -0700
++++ linux-3.15.2-dprio/fs/exec.c	2014-07-24 12:37:11.000000000 -0700
 @@ -56,6 +56,7 @@
  #include <linux/pipe_fs_i.h>
  #include <linux/oom.h>
@@ -46,7 +46,7 @@ diff -uprN linux-3.15.2/fs/exec.c linux-3.15.2-dprio/fs/exec.c
  	current->in_execve = 0;
 diff -uprN linux-3.15.2/fs/proc/authlist.c linux-3.15.2-dprio/fs/proc/authlist.c
 --- linux-3.15.2/fs/proc/authlist.c	1969-12-31 16:00:00.000000000 -0800
-+++ linux-3.15.2-dprio/fs/proc/authlist.c	2014-07-21 04:07:23.000000000 -0700
++++ linux-3.15.2-dprio/fs/proc/authlist.c	2014-07-24 12:37:11.000000000 -0700
 @@ -0,0 +1,493 @@
 +/*
 + * fs/proc/authlist.c
@@ -543,7 +543,7 @@ diff -uprN linux-3.15.2/fs/proc/authlist.c linux-3.15.2-dprio/fs/proc/authlist.c
 +
 diff -uprN linux-3.15.2/fs/proc/Makefile linux-3.15.2-dprio/fs/proc/Makefile
 --- linux-3.15.2/fs/proc/Makefile	2014-06-26 12:17:52.000000000 -0700
-+++ linux-3.15.2-dprio/fs/proc/Makefile	2014-07-21 04:07:23.000000000 -0700
++++ linux-3.15.2-dprio/fs/proc/Makefile	2014-07-24 12:37:11.000000000 -0700
 @@ -29,3 +29,4 @@ proc-$(CONFIG_PROC_KCORE)	+= kcore.o
  proc-$(CONFIG_PROC_VMCORE)	+= vmcore.o
  proc-$(CONFIG_PRINTK)	+= kmsg.o
@@ -551,7 +551,7 @@ diff -uprN linux-3.15.2/fs/proc/Makefile linux-3.15.2-dprio/fs/proc/Makefile
 +proc-$(CONFIG_DEFERRED_SETPRIO) += authlist.o
 diff -uprN linux-3.15.2/include/linux/authlist.h linux-3.15.2-dprio/include/linux/authlist.h
 --- linux-3.15.2/include/linux/authlist.h	1969-12-31 16:00:00.000000000 -0800
-+++ linux-3.15.2-dprio/include/linux/authlist.h	2014-07-21 04:07:24.000000000 -0700
++++ linux-3.15.2-dprio/include/linux/authlist.h	2014-07-24 12:37:11.000000000 -0700
 @@ -0,0 +1,114 @@
 +/*
 + * include/linux/authlist.h
@@ -669,7 +669,7 @@ diff -uprN linux-3.15.2/include/linux/authlist.h linux-3.15.2-dprio/include/linu
 +
 diff -uprN linux-3.15.2/include/linux/dprio.h linux-3.15.2-dprio/include/linux/dprio.h
 --- linux-3.15.2/include/linux/dprio.h	1969-12-31 16:00:00.000000000 -0800
-+++ linux-3.15.2-dprio/include/linux/dprio.h	2014-07-21 04:07:24.000000000 -0700
++++ linux-3.15.2-dprio/include/linux/dprio.h	2014-07-24 12:37:11.000000000 -0700
 @@ -0,0 +1,130 @@
 +/*
 + * include/linux/dprio.h
@@ -692,10 +692,10 @@ diff -uprN linux-3.15.2/include/linux/dprio.h linux-3.15.2-dprio/include/linux/d
 +#ifdef CONFIG_DEFERRED_SETPRIO
 +
 +/*
-+ * @mask contains bit-flags indicating which policies had been pre-approved.
-+ * Other fields are valid only if the corresponding bit is set in @mask.
++ * @mask contains bit-flags indicating which policies have been pre-approved.
++ * Other fields are valid only if the corresponding bit is set in the @mask.
 + */
-+static inline void __dprio_info_assumptions(void)
++static __always_inline void __dprio_info_assumptions(void)
 +{
 +	/* SCHED_xxx is used as a bit index in @mask */
 +	BUILD_BUG_ON(SCHED_NORMAL > 31);
@@ -803,7 +803,7 @@ diff -uprN linux-3.15.2/include/linux/dprio.h linux-3.15.2-dprio/include/linux/d
 +
 diff -uprN linux-3.15.2/include/linux/init_task.h linux-3.15.2-dprio/include/linux/init_task.h
 --- linux-3.15.2/include/linux/init_task.h	2014-06-26 12:17:52.000000000 -0700
-+++ linux-3.15.2-dprio/include/linux/init_task.h	2014-07-21 04:07:24.000000000 -0700
++++ linux-3.15.2-dprio/include/linux/init_task.h	2014-07-24 12:37:11.000000000 -0700
 @@ -164,6 +164,22 @@ extern struct task_group root_task_group
  # define INIT_RT_MUTEXES(tsk)
  #endif
@@ -837,8 +837,8 @@ diff -uprN linux-3.15.2/include/linux/init_task.h linux-3.15.2-dprio/include/lin
  
 diff -uprN linux-3.15.2/include/linux/sched.h linux-3.15.2-dprio/include/linux/sched.h
 --- linux-3.15.2/include/linux/sched.h	2014-06-26 12:17:52.000000000 -0700
-+++ linux-3.15.2-dprio/include/linux/sched.h	2014-07-21 04:07:24.000000000 -0700
-@@ -1610,6 +1610,13 @@ struct task_struct {
++++ linux-3.15.2-dprio/include/linux/sched.h	2014-07-24 12:37:11.000000000 -0700
+@@ -1610,6 +1610,16 @@ struct task_struct {
  	unsigned int	sequential_io;
  	unsigned int	sequential_io_avg;
  #endif
@@ -846,13 +846,16 @@ diff -uprN linux-3.15.2/include/linux/sched.h linux-3.15.2-dprio/include/linux/s
 +	struct dprio_ku_area __user * __user *dprio_ku_area_pp;
 +	struct dprio_info *dprio_info;
 +#endif
++#ifdef CONFIG_PUT_TASK_TIMEBOUND
++	struct work_struct put_task_work;
++#endif
 +#ifdef CONFIG_DEBUG_DEFERRED_SETPRIO
 +	bool in_dprio;
 +#endif
  };
  
  /* Future-safe accessor for struct task_struct's cpus_allowed. */
-@@ -2150,6 +2157,11 @@ extern int sched_setscheduler_nocheck(st
+@@ -2150,6 +2160,11 @@ extern int sched_setscheduler_nocheck(st
  				      const struct sched_param *);
  extern int sched_setattr(struct task_struct *,
  			 const struct sched_attr *);
@@ -866,7 +869,7 @@ diff -uprN linux-3.15.2/include/linux/sched.h linux-3.15.2-dprio/include/linux/s
   * is_idle_task - is the specified task an idle task?
 diff -uprN linux-3.15.2/include/uapi/linux/prctl.h linux-3.15.2-dprio/include/uapi/linux/prctl.h
 --- linux-3.15.2/include/uapi/linux/prctl.h	2014-06-26 12:17:52.000000000 -0700
-+++ linux-3.15.2-dprio/include/uapi/linux/prctl.h	2014-07-21 04:07:24.000000000 -0700
++++ linux-3.15.2-dprio/include/uapi/linux/prctl.h	2014-07-24 12:37:11.000000000 -0700
 @@ -152,4 +152,6 @@
  #define PR_SET_THP_DISABLE	41
  #define PR_GET_THP_DISABLE	42
@@ -876,7 +879,7 @@ diff -uprN linux-3.15.2/include/uapi/linux/prctl.h linux-3.15.2-dprio/include/ua
  #endif /* _LINUX_PRCTL_H */
 diff -uprN linux-3.15.2/init/Kconfig linux-3.15.2-dprio/init/Kconfig
 --- linux-3.15.2/init/Kconfig	2014-06-26 12:17:52.000000000 -0700
-+++ linux-3.15.2-dprio/init/Kconfig	2014-07-21 04:07:24.000000000 -0700
++++ linux-3.15.2-dprio/init/Kconfig	2014-07-24 12:37:11.000000000 -0700
 @@ -1886,3 +1886,5 @@ config ASN1
  	  functions to call on what tags.
  
@@ -885,7 +888,7 @@ diff -uprN linux-3.15.2/init/Kconfig linux-3.15.2-dprio/init/Kconfig
 +
 diff -uprN linux-3.15.2/kernel/exit.c linux-3.15.2-dprio/kernel/exit.c
 --- linux-3.15.2/kernel/exit.c	2014-06-26 12:17:52.000000000 -0700
-+++ linux-3.15.2-dprio/kernel/exit.c	2014-07-21 04:07:24.000000000 -0700
++++ linux-3.15.2-dprio/kernel/exit.c	2014-07-24 12:37:11.000000000 -0700
 @@ -53,6 +53,7 @@
  #include <linux/oom.h>
  #include <linux/writeback.h>
@@ -908,7 +911,7 @@ diff -uprN linux-3.15.2/kernel/exit.c linux-3.15.2-dprio/kernel/exit.c
  	/*
 diff -uprN linux-3.15.2/kernel/fork.c linux-3.15.2-dprio/kernel/fork.c
 --- linux-3.15.2/kernel/fork.c	2014-06-26 12:17:52.000000000 -0700
-+++ linux-3.15.2-dprio/kernel/fork.c	2014-07-21 04:07:24.000000000 -0700
++++ linux-3.15.2-dprio/kernel/fork.c	2014-07-24 12:37:11.000000000 -0700
 @@ -74,6 +74,7 @@
  #include <linux/uprobes.h>
  #include <linux/aio.h>
@@ -926,23 +929,65 @@ diff -uprN linux-3.15.2/kernel/fork.c linux-3.15.2-dprio/kernel/fork.c
  {
  	WARN_ON(!tsk->exit_state);
  	WARN_ON(atomic_read(&tsk->usage));
-@@ -249,6 +250,43 @@ void __put_task_struct(struct task_struc
+@@ -249,6 +250,83 @@ void __put_task_struct(struct task_struc
  	if (!profile_handoff_task(tsk))
  		free_task(tsk);
  }
 +
-+#ifdef CONFIG_DEFERRED_SETPRIO
++#ifdef CONFIG_PUT_TASK_TIMEBOUND
++/*
++ * If timebound, use preallocated struct work_struct always guaranteed
++ * to be available, even if atomic kmalloc pool is depleted.
++ */
++static inline struct work_struct *alloc_put_task_work(struct task_struct *tsk)
++{
++	return &tsk->put_task_work;
++}
++
++static inline void free_put_task_work(struct work_struct *work)
++{
++}
++
++static inline struct task_struct *put_task_work_tsk(struct work_struct *work)
++{
++	return container_of(work, struct task_struct, put_task_work);
++}
++#else
 +struct put_task_work {
 +	struct work_struct work;
 +	struct task_struct *tsk;
 +};
 +
-+static void __put_task_struct_work(struct work_struct *work)
++static inline struct work_struct *alloc_put_task_work(struct task_struct *tsk)
++{
++	struct put_task_work *dwork =
++		kmalloc(sizeof(*dwork), GFP_NOWAIT | __GFP_NOWARN);
++	if (unlikely(!dwork))
++		return NULL;
++	dwork->tsk = tsk;
++	return &dwork->work;
++}
++
++static inline void free_put_task_work(struct work_struct *work)
 +{
 +	struct put_task_work *dwork =
 +		container_of(work, struct put_task_work, work);
-+	__do_put_task_struct(dwork->tsk);
 +	kfree(dwork);
++}
++
++static inline struct task_struct *put_task_work_tsk(struct work_struct *work)
++{
++	struct put_task_work *dwork =
++		container_of(work, struct put_task_work, work);
++	return dwork->tsk;
++}
++#endif
++
++#ifdef CONFIG_DEFERRED_SETPRIO
++static void __put_task_struct_work(struct work_struct *work)
++{
++	__do_put_task_struct(put_task_work_tsk(work));
++	free_put_task_work(work);
 +}
 +#endif
 +
@@ -950,15 +995,13 @@ diff -uprN linux-3.15.2/kernel/fork.c linux-3.15.2-dprio/kernel/fork.c
 +{
 +#ifdef CONFIG_DEFERRED_SETPRIO
 +	/*
-+	 * When called from inside __schedule, try to defer processing to
-+	 * a worker thread, in order to mininize the scheduling latency.
++	 * When called from inside of __schedule(), try to defer processing
++	 * to a worker thread, in order to mininize the scheduling latency
++	 * and make it deterministic.
 +	 */
 +	if (unlikely(preempt_count() & PREEMPT_ACTIVE)) {
-+		struct put_task_work *dwork =
-+			kmalloc(sizeof(*dwork), GFP_NOWAIT | __GFP_NOWARN);
-+		if (dwork) {
-+			struct work_struct *work = &dwork->work;
-+			dwork->tsk = tsk;
++		struct work_struct *work = alloc_put_task_work(tsk);
++		if (likely(work)) {
 +			INIT_WORK(work, __put_task_struct_work);
 +			schedule_work(work);
 +			return;
@@ -970,7 +1013,7 @@ diff -uprN linux-3.15.2/kernel/fork.c linux-3.15.2-dprio/kernel/fork.c
  EXPORT_SYMBOL_GPL(__put_task_struct);
  
  void __init __weak arch_task_cache_init(void) { }
-@@ -314,6 +352,8 @@ static struct task_struct *dup_task_stru
+@@ -314,6 +392,8 @@ static struct task_struct *dup_task_stru
  	if (err)
  		goto free_ti;
  
@@ -979,7 +1022,7 @@ diff -uprN linux-3.15.2/kernel/fork.c linux-3.15.2-dprio/kernel/fork.c
  	tsk->stack = ti;
  
  	setup_thread_stack(tsk, orig);
-@@ -1581,6 +1621,11 @@ long do_fork(unsigned long clone_flags,
+@@ -1581,6 +1661,11 @@ long do_fork(unsigned long clone_flags,
  	long nr;
  
  	/*
@@ -993,9 +1036,9 @@ diff -uprN linux-3.15.2/kernel/fork.c linux-3.15.2-dprio/kernel/fork.c
  	 * requested, no event is reported; otherwise, report if the event
 diff -uprN linux-3.15.2/kernel/Kconfig.dprio linux-3.15.2-dprio/kernel/Kconfig.dprio
 --- linux-3.15.2/kernel/Kconfig.dprio	1969-12-31 16:00:00.000000000 -0800
-+++ linux-3.15.2-dprio/kernel/Kconfig.dprio	2014-07-21 04:07:24.000000000 -0700
-@@ -0,0 +1,60 @@
-+config DEFERRED_SETPRIO
++++ linux-3.15.2-dprio/kernel/Kconfig.dprio	2014-07-24 12:37:11.000000000 -0700
+@@ -0,0 +1,81 @@
++menuconfig DEFERRED_SETPRIO
 +	bool "Enable deferred setting of task priority"
 +	default n
 +	help
@@ -1017,6 +1060,26 @@ diff -uprN linux-3.15.2/kernel/Kconfig.dprio linux-3.15.2-dprio/kernel/Kconfig.d
 +	  real-time use.
 +
 +	  If unsure, say N.
++
++if DEFERRED_SETPRIO
++
++config PUT_TASK_TIMEBOUND
++	bool "Deterministic task switch latency when deferred set task priority is used"
++	depends on DEFERRED_SETPRIO && RT_MUTEXES
++	default n
++	help
++	  Enabling this option ensures deterministic time-bound task switch
++	  latency when a deferred set priority request is pending on a task
++	  rescheduling and switch and the processing of this request causes
++	  an adjustment of priority inheritance chain under very low memory
++	  conditions (depleted atomic pool).
++
++	  Select Y if building the kernel for hard real-time system requiring
++	  the determinism in task switch latency. Select N for general-purpose
++	  desktop or server system.
++
++	  This option has memory cost of about 20-40 bytes per each running task
++	  in the system.
 +
 +config DEBUG_DEFERRED_SETPRIO
 +	bool "Enable debugging code for deferred task priority setting"
@@ -1055,9 +1118,10 @@ diff -uprN linux-3.15.2/kernel/Kconfig.dprio linux-3.15.2-dprio/kernel/Kconfig.d
 +
 +endchoice
 +
++endif # DEFERRED_SETPRIO
 diff -uprN linux-3.15.2/kernel/sched/core.c linux-3.15.2-dprio/kernel/sched/core.c
 --- linux-3.15.2/kernel/sched/core.c	2014-06-26 12:17:52.000000000 -0700
-+++ linux-3.15.2-dprio/kernel/sched/core.c	2014-07-21 04:07:24.000000000 -0700
++++ linux-3.15.2-dprio/kernel/sched/core.c	2014-07-24 12:37:11.000000000 -0700
 @@ -74,6 +74,7 @@
  #include <linux/binfmts.h>
  #include <linux/context_tracking.h>
@@ -1376,7 +1440,7 @@ diff -uprN linux-3.15.2/kernel/sched/core.c linux-3.15.2-dprio/kernel/sched/core
  static int
 diff -uprN linux-3.15.2/kernel/sched/dprio.c linux-3.15.2-dprio/kernel/sched/dprio.c
 --- linux-3.15.2/kernel/sched/dprio.c	1969-12-31 16:00:00.000000000 -0800
-+++ linux-3.15.2-dprio/kernel/sched/dprio.c	2014-07-21 04:07:24.000000000 -0700
++++ linux-3.15.2-dprio/kernel/sched/dprio.c	2014-07-24 12:37:11.000000000 -0700
 @@ -0,0 +1,734 @@
 +/*
 + * kernel/sched/dprio.c
@@ -2114,7 +2178,7 @@ diff -uprN linux-3.15.2/kernel/sched/dprio.c linux-3.15.2-dprio/kernel/sched/dpr
 +
 diff -uprN linux-3.15.2/kernel/sched/Makefile linux-3.15.2-dprio/kernel/sched/Makefile
 --- linux-3.15.2/kernel/sched/Makefile	2014-06-26 12:17:52.000000000 -0700
-+++ linux-3.15.2-dprio/kernel/sched/Makefile	2014-07-21 04:07:24.000000000 -0700
++++ linux-3.15.2-dprio/kernel/sched/Makefile	2014-07-24 12:37:11.000000000 -0700
 @@ -19,3 +19,4 @@ obj-$(CONFIG_SCHED_AUTOGROUP) += auto_gr
  obj-$(CONFIG_SCHEDSTATS) += stats.o
  obj-$(CONFIG_SCHED_DEBUG) += debug.o
@@ -2123,7 +2187,7 @@ diff -uprN linux-3.15.2/kernel/sched/Makefile linux-3.15.2-dprio/kernel/sched/Ma
 \ No newline at end of file
 diff -uprN linux-3.15.2/kernel/sys.c linux-3.15.2-dprio/kernel/sys.c
 --- linux-3.15.2/kernel/sys.c	2014-06-26 12:17:52.000000000 -0700
-+++ linux-3.15.2-dprio/kernel/sys.c	2014-07-21 04:07:24.000000000 -0700
++++ linux-3.15.2-dprio/kernel/sys.c	2014-07-24 12:37:11.000000000 -0700
 @@ -52,6 +52,7 @@
  #include <linux/rcupdate.h>
  #include <linux/uidgid.h>
@@ -2146,7 +2210,7 @@ diff -uprN linux-3.15.2/kernel/sys.c linux-3.15.2-dprio/kernel/sys.c
  		break;
 diff -uprN linux-3.15.2/kernel/sysctl.c linux-3.15.2-dprio/kernel/sysctl.c
 --- linux-3.15.2/kernel/sysctl.c	2014-06-26 12:17:52.000000000 -0700
-+++ linux-3.15.2-dprio/kernel/sysctl.c	2014-07-21 04:07:24.000000000 -0700
++++ linux-3.15.2-dprio/kernel/sysctl.c	2014-07-24 12:37:11.000000000 -0700
 @@ -63,6 +63,8 @@
  #include <linux/binfmts.h>
  #include <linux/sched/sysctl.h>
