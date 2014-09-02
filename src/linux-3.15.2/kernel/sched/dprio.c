@@ -720,7 +720,7 @@ out:
  */
 int dprio_check_permission(void)
 {
-	if (dprio_privileged == true && !capable(CAP_DPRIO))
+	if (dprio_privileged && !capable(CAP_DPRIO))
 		return -EPERM;
 
 	return 0;
