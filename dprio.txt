@@ -153,6 +153,18 @@ SCHED_DEADLINE is not a meaningful policy for use cases that DPRIO is intended
 for, and cannot be used with DPRIO. An attempt to specify  SCHED_DEADLINE in 
 sched_attr_pp will result in prctl(PR_SET_DEFERRED_SETPRIO) returning an error.
 
+    Note that using SCHED_NORMAL and SCHED_BATCH does not provide a protection
+    against a preemption at the expiration of the task's timeslice. Using
+    negative "nice" value ensures a greater thread's claim to CPU resources
+    over a longer time frame, but does not secure it against a preemption by
+    peer threads in the short-term. Therefore lock-holding and most other
+    time-urgent critical sections will typically use SCHED_FIFO or SCHED_RR for
+    priority protection.
+
+    Still there are potentially some rare cases when using SCHED_NORMAL or
+    SCHED_BATCH for "soft" priority protection may come in handy in the DPRIO
+    context. See https://lkml.org/lkml/2014/8/6/593 for details.
+
 More specifically, stored pre-authorization consists of:
 
     (a) For each scheduling policy listed in sched_attrs_pp, the highest
@@ -487,14 +499,12 @@ is actually pending, so in most cases it won't be significant, however in those
 cases where it might be, DPRIO provides an authorization mechanism controlling 
 who is allowed to use the DPRIO facility.
 
-Two build options (only one of them is selectable at a time) define who is 
-initially authorized to use DPRIO facility. Selecting 
-CONFIG_DEFERRED_SETPRIO_ALLOW_EVERYBODY will initially permit every user on the 
-system to utilize DPRIO. Selecting DEFERRED_SETPRIO_ALLOW_NOBODY will initially 
-disallow all users on the system, except root, to utilize DPRIO.  These initial 
-settings are in effect right after system boot, however the setting can be 
-dynamically modified by specifying a DPRIO authorization list as described 
-below.
+Build option DEFERRED_SETPRIO_PRIVILEGED defines who is initially authorized
+to use the DPRIO facility. Selecting "No" will initially permit every user on
+the system to utilize DPRIO. Selecting "Yes" will initially allow only users
+with CAP_DPRIO capability to use the facility. This initial setting is in
+effect right after system boot, however it can be dynamically altered via
+/proc/sys/kernel/dprio_privileged, as described below.
 
 Build option CONFIG_PUT_TASK_TIMEBOUND ensures fast and deterministically
 time-bound task switch latency (as far as DPRIO impact is concerned) when a
@@ -524,37 +534,50 @@ switch path. Select N for general-purpose desktop or server system.
 Build option CONFIG_DEBUG_DEFERRED_SETPRIO enables the debug code for DPRIO.
 
 
-DPRIO AUTHORIZATION LIST
-========================
+DPRIO AUTHORIZATION
+===================
 
-The list of users permitted to utilize the DPRIO facility can be dynamically 
-specified by writing the DPRIO authorization list to 
-/proc/sys/kernel/dprio_authlist. The list can also be read back from the file.
+DPRIO works by making a check at __schedule() time for whether a deferred set
+priority request is pending, and if so, then performing an equivalent of
+sched_setattr(), minus security checks, before the rescheduling.
 
-If CONFIG_DEFERRED_SETPRIO_ALLOW_EVERYBODY is enabled, the list is initially 
-set to "everybody".
+This introduces additional latency at task switch time when a deferred set
+priority request is pending -- albeit normally a very small latency, but
+non-zero one and a malicious user can also manoeuvre into increasing it. There
+are two parts to this latency. One is more or less constant part in the order
+of 1 usec, that's basic __sched_setscheduler() code. The other part is due to
+possible priority inheritance chain adjustment in rt_mutex_adjust_pi() and
+depends on the length of the chain. Malicious user might conceivably construct
+a very long chain, long enough for processing of this chain at the time of
+__schedule to cause an objectionable latency. On systems where this might be a
+concern, administrator may therefore want to restrict the use of DPRIO to
+legitimate trusted applications (or users of those).
 
-If CONFIG_DEFERRED_SETPRIO_ALLOW_NOBODY is enabled, the list is initially set 
-to "nobody".
+Build option DEFERRED_SETPRIO_PRIVILEGED defines who is initially authorized
+to use the DPRIO facility. Selecting "No" will initially permit every user on
+the system to utilize DPRIO. Selecting "Yes" will initially allow only users
+with CAP_DPRIO capability to use the facility. This initial setting is in
+effect right after system boot, however it can be dynamically altered via
+/proc/sys/kernel/dprio_privileged.
 
-The list is a sequence of whitespace-separated entries, each entry having one 
-of the following formats:
+Writing value of "1" into /proc/sys/kernel/dprio_privileged makes DPRIO
+to require the caller to have CAP_DPRIO capability. If the caller of
+prctl(PR_SET_DEFERRED_SETPRIO) does not have CAP_DPRIO, prctl call
+will return error status of -EPERM.
 
-    uid:<numeric-uid>
-    gid:<numeric-gid>
-    nouid:<numeric-uid>
-    nogid:<numeric-gid>
-    everybody
-    nobody
+Writing value of "0" into /proc/sys/kernel/dprio_privileged makes DPRIO
+facility available to unprivileged users.
 
-For instance: "uid:47 uid:100 gid:12 nobody".
-Or: "nogid:300 everybody".
+System administrator may designate specific applications as having a right
+to use DPRIO even when launched by a non-privileged user by setting the
+capability on application's executable file:
 
-Terminal entry must always be either "nobody" or "everybody".
+    # setcap CAP_DPRIO+eip  /path/application
 
-The task with current effective UID of root user (i.e. namespace-global root) 
-is always allowed to use DPRIO, even if the authorization list is set to 
-"nobody" or otherwise does not permit the task to use DPRIO.
+or until libcap is updated to recognize the name of CAP_DPRIO, by using
+the capability's numeric value:
+
+    # setcap 37+eip  /path/application
 
 
 PRIOR ART
@@ -691,3 +714,5 @@ covered by the existing mechanisms, and can be used by applications both
 directly, and also as an efficient underlying facility in the implementation of 
 PTHREADS priority protection and other higher-level synchronization primitives.
 
+For an overview of DPRIO within the space of other preemption handling
+solutions and techniques, see https://lkml.org/lkml/2014/8/13/744.
