@@ -577,7 +577,7 @@ capability on application's executable file:
 or until libcap is updated to recognize the name of CAP_DPRIO, by using
 the capability's numeric value:
 
-    # setcap 37+eip  /path/application
+    # setcap 38+eip  /path/application
 
 
 PRIOR ART
@@ -716,3 +716,28 @@ PTHREADS priority protection and other higher-level synchronization primitives.
 
 For an overview of DPRIO within the space of other preemption handling
 solutions and techniques, see https://lkml.org/lkml/2014/8/13/744.
+
+IMPACT OF HYPERVISORS
+=====================
+
+Priority protection schemes are vulnerable when guest OS is running on top of a
+hypervisor in a configuration overcommitted with regard to CPU capacity.
+Hypervisor typically is oblivious of guest OS scheduling data and may deschedule
+a VCPU regardless of the priority of the task a VCPU is currently executing,
+yielding PCPU resources to a VCPU running a lower priority task,  and thus
+creating a form of priority inversion.
+
+For an applications likely to be deployed in such a configuration, it is
+therefore specifically advisable to combine priority protection with a form
+of post-preemption solution (such as spin-then-yield-to) wherever possible.
+
+Priority protection forms a front line of defense avoiding incurring the cost
+of inopportune preemption in the major number of cases, whereas post-preemption
+solution limits the worst-case cost.
+
+In a longer run, it may be desirable to develop an integrated guest OS -
+hypervisor mechanism to allow lock waiters to know that lock holder had been
+preempted (either as a process by guest OS or the whole VCPU had been preempted
+by a hypervisor), so the waiters can yield immediatelly in favor of a lock
+holder.
+
