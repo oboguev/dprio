@@ -1,0 +1,1733 @@
+ .../Documentation/sysctl/kernel.txt                |  14 +
+ {linux-3.16.3 => linux-3.16.3-dprio}/fs/exec.c     |   8 +
+ .../include/linux/dprio.h                          | 129 +++++
+ .../include/linux/init_task.h                      |  17 +
+ .../include/linux/sched.h                          |  19 +
+ .../include/uapi/linux/Kbuild                      |   1 +
+ .../include/uapi/linux/capability.h                |   5 +-
+ .../include/uapi/linux/dprio_api.h                 | 137 +++++
+ .../include/uapi/linux/prctl.h                     |   2 +
+ {linux-3.16.3 => linux-3.16.3-dprio}/init/Kconfig  |   2 +
+ .../kernel/Kconfig.dprio                           |  68 +++
+ {linux-3.16.3 => linux-3.16.3-dprio}/kernel/exit.c |   6 +
+ {linux-3.16.3 => linux-3.16.3-dprio}/kernel/fork.c |  88 ++-
+ .../kernel/sched/Makefile                          |   1 +
+ .../kernel/sched/core.c                            | 195 ++++++-
+ .../kernel/sched/dprio.c                           | 617 +++++++++++++++++++++
+ {linux-3.16.3 => linux-3.16.3-dprio}/kernel/sys.c  |   6 +
+ .../kernel/sysctl.c                                |  12 +
+ 18 files changed, 1315 insertions(+), 12 deletions(-)
+
+diff --git a/linux-3.16.3/Documentation/sysctl/kernel.txt b/linux-3.16.3-dprio/Documentation/sysctl/kernel.txt
+index c14374e..012cbad 100644
+--- a/linux-3.16.3/Documentation/sysctl/kernel.txt
++++ b/linux-3.16.3-dprio/Documentation/sysctl/kernel.txt
+@@ -30,6 +30,7 @@ show up in /proc/sys/kernel:
+ - core_uses_pid
+ - ctrl-alt-del
+ - dmesg_restrict
++- dprio_privileged
+ - domainname
+ - hostname
+ - hotplug
+@@ -267,6 +268,19 @@ default value of dmesg_restrict.
+ 
+ ==============================================================
+ 
++dprio_privileged:
++
++This toggle indicates whether unprivileged users are prevented
++from using dprio(2) to execute deferred set priority requests.
++When dprio_privileged is set to (0) there are no restrictions.
++When dprio_privileged is set set to (1), users must have CAP_DPRIO
++to use dprio(2), i.e. prctl(PR_SET_DEFERRED_SETPRIO).
++
++The kernel config option CONFIG_DEFERRED_SETPRIO_PRIVILEGED sets
++the default value of dprio_privileged.
++
++==============================================================
++
+ domainname & hostname:
+ 
+ These files can be used to set the NIS/YP domainname and the
+diff --git a/linux-3.16.3/fs/exec.c b/linux-3.16.3-dprio/fs/exec.c
+index a3d33fe..49a5547 100644
+--- a/linux-3.16.3/fs/exec.c
++++ b/linux-3.16.3-dprio/fs/exec.c
+@@ -56,6 +56,7 @@
+ #include <linux/pipe_fs_i.h>
+ #include <linux/oom.h>
+ #include <linux/compat.h>
++#include <linux/dprio.h>
+ 
+ #include <asm/uaccess.h>
+ #include <asm/mmu_context.h>
+@@ -1434,6 +1435,7 @@ static int do_execve_common(struct filename *filename,
+ 	struct file *file;
+ 	struct files_struct *displaced;
+ 	int retval;
++	struct dprio_saved_context dprio_context;
+ 
+ 	if (IS_ERR(filename))
+ 		return PTR_ERR(filename);
+@@ -1484,6 +1486,9 @@ static int do_execve_common(struct filename *filename,
+ 	if (retval)
+ 		goto out_unmark;
+ 
++	dprio_handle_request();
++	dprio_save_reset_context(&dprio_context);
++
+ 	bprm->argc = count(argv, MAX_ARG_STRINGS);
+ 	if ((retval = bprm->argc) < 0)
+ 		goto out;
+@@ -1522,6 +1527,7 @@ static int do_execve_common(struct filename *filename,
+ 	putname(filename);
+ 	if (displaced)
+ 		put_files_struct(displaced);
++	dprio_free_context(&dprio_context);
+ 	return retval;
+ 
+ out:
+@@ -1530,6 +1536,8 @@ out:
+ 		mmput(bprm->mm);
+ 	}
+ 
++	dprio_restore_context(&dprio_context);
++
+ out_unmark:
+ 	current->fs->in_exec = 0;
+ 	current->in_execve = 0;
+diff --git a/linux-3.16.3-dprio/include/linux/dprio.h b/linux-3.16.3-dprio/include/linux/dprio.h
+new file mode 100644
+index 0000000..1119c00
+--- /dev/null
++++ b/linux-3.16.3-dprio/include/linux/dprio.h
+@@ -0,0 +1,129 @@
++/*
++ * include/linux/dprio.h
++ *
++ * Deferred set priority.
++ *
++ * Started by (C) 2014 Sergey Oboguev <oboguev@yahoo.com>
++ *
++ * This code is licenced under the GPL version 2 or later.
++ * For details see linux-kernel-base/COPYING.
++ */
++
++#ifndef _LINUX_DPRIO_H
++#define _LINUX_DPRIO_H
++
++#include <linux/sched.h>
++#include <linux/slab.h>
++
++#ifdef CONFIG_DEFERRED_SETPRIO
++
++/*
++ * @mask contains bit-flags indicating which policies have been pre-approved.
++ * Other fields are valid only if the corresponding bit is set in the @mask.
++ */
++static __always_inline void __dprio_info_assumptions(void)
++{
++	/* SCHED_xxx is used as a bit index in @mask */
++	BUILD_BUG_ON(SCHED_NORMAL > 31);
++	BUILD_BUG_ON(SCHED_FIFO > 31);
++	BUILD_BUG_ON(SCHED_RR > 31);
++	BUILD_BUG_ON(SCHED_BATCH > 31);
++	BUILD_BUG_ON(SCHED_IDLE > 31);
++}
++struct dprio_info {
++	unsigned mask;
++	s32 normal_sched_nice;
++	s32 batch_sched_nice;
++	u32 fifo_sched_priority;
++	u32 rr_sched_priority;
++	bool capable_sys_nice;
++};
++
++/*
++ * Called by dup_task_struct to reset non-inherited fields
++ */
++static __always_inline void set_task_in_dprio(struct task_struct *tsk,
++					      bool in_dprio)
++{
++#ifdef CONFIG_DEBUG_DEFERRED_SETPRIO
++	tsk->in_dprio = in_dprio;
++#endif
++}
++
++static inline void dprio_dup_task_struct(struct task_struct *tsk)
++{
++	/* reset deferred setprio fields not inherited from the parent */
++	tsk->dprio_ku_area_pp = NULL;
++	tsk->dprio_info = NULL;
++	set_task_in_dprio(tsk, false);
++}
++
++void dprio_detach(struct task_struct *tsk);
++void dprio_handle_request(void);
++bool dprio_check_for_request(struct task_struct *prev);
++long dprio_prctl(int option, unsigned long a2, unsigned long a3,
++		 unsigned long a4, unsigned long a5);
++
++struct dprio_saved_context {
++	struct dprio_ku_area __user * __user *dprio_ku_area_pp;
++	struct dprio_info *dprio_info;
++};
++
++static inline void dprio_save_reset_context(struct dprio_saved_context *saved)
++{
++	saved->dprio_ku_area_pp = current->dprio_ku_area_pp;
++	saved->dprio_info = current->dprio_info;
++
++	if (unlikely(saved->dprio_ku_area_pp)) {
++		preempt_disable();
++		current->dprio_ku_area_pp = NULL;
++		current->dprio_info = NULL;
++		preempt_enable();
++	}
++}
++
++static inline void dprio_restore_context(struct dprio_saved_context *saved)
++{
++	if (unlikely(saved->dprio_ku_area_pp)) {
++		preempt_disable();
++		current->dprio_ku_area_pp = saved->dprio_ku_area_pp;
++		current->dprio_info = saved->dprio_info;
++		preempt_enable();
++	}
++}
++
++static inline void dprio_free_context(struct dprio_saved_context *saved)
++{
++	if (unlikely(saved->dprio_info))
++		kfree(saved->dprio_info);
++}
++
++#ifdef CONFIG_DEFERRED_SETPRIO_PRIVILEGED
++  #define DPRIO_PRIVILEGED_INITIAL_VALUE  true
++#else
++  #define DPRIO_PRIVILEGED_INITIAL_VALUE  false
++#endif
++
++extern unsigned int dprio_privileged;
++
++int dprio_check_permission(void);
++
++#else /* ndef CONFIG_DEFERRED_SETPRIO */
++
++static inline void set_task_in_dprio(struct task_struct *tsk, bool in_dprio) {}
++static inline void dprio_dup_task_struct(struct task_struct *tsk) {}
++static inline void dprio_detach(struct task_struct *tsk) {}
++static inline void dprio_handle_request(void) {}
++
++struct dprio_saved_context {
++	char dummy[0];		/* suppress compiler warning */
++};
++
++static inline void dprio_save_reset_context(struct dprio_saved_context *saved) {}
++static inline void dprio_restore_context(struct dprio_saved_context *saved) {}
++static inline void dprio_free_context(struct dprio_saved_context *saved) {}
++
++#endif /* CONFIG_DEFERRED_SETPRIO */
++
++#endif /* _LINUX_DPRIO_H */
++
+diff --git a/linux-3.16.3/include/linux/init_task.h b/linux-3.16.3-dprio/include/linux/init_task.h
+index 6df7f9f..bdc6767 100644
+--- a/linux-3.16.3/include/linux/init_task.h
++++ b/linux-3.16.3-dprio/include/linux/init_task.h
+@@ -164,6 +164,22 @@ extern struct task_group root_task_group;
+ # define INIT_RT_MUTEXES(tsk)
+ #endif
+ 
++#ifdef CONFIG_DEBUG_DEFERRED_SETPRIO
++# define INIT_DEFERRED_SETPRIO_DEBUG					\
++	.in_dprio = false,
++#else
++# define INIT_DEFERRED_SETPRIO_DEBUG
++#endif
++
++#ifdef CONFIG_DEFERRED_SETPRIO
++# define INIT_DEFERRED_SETPRIO						\
++	.dprio_ku_area_pp = NULL,					\
++	.dprio_info = NULL,						\
++	INIT_DEFERRED_SETPRIO_DEBUG
++#else
++# define INIT_DEFERRED_SETPRIO
++#endif
++
+ /*
+  *  INIT_TASK is used to set up the first task table, touch at
+  * your own risk!. Base=0, limit=0x1fffff (=2MB)
+@@ -234,6 +250,7 @@ extern struct task_group root_task_group;
+ 	INIT_CPUSET_SEQ(tsk)						\
+ 	INIT_RT_MUTEXES(tsk)						\
+ 	INIT_VTIME(tsk)							\
++	INIT_DEFERRED_SETPRIO						\
+ }
+ 
+ 
+diff --git a/linux-3.16.3/include/linux/sched.h b/linux-3.16.3-dprio/include/linux/sched.h
+index 0376b05..42af7f3 100644
+--- a/linux-3.16.3/include/linux/sched.h
++++ b/linux-3.16.3-dprio/include/linux/sched.h
+@@ -1237,6 +1237,11 @@ struct task_struct {
+ 
+ 	int wake_cpu;
+ #endif
++#ifdef CONFIG_DEFERRED_SETPRIO
++	/* try to keep @dprio_ku_area in the same cacheline as @state or
++	   @on_rq or @sched_class */
++	struct dprio_ku_area __user * __user *dprio_ku_area_pp;
++#endif
+ 	int on_rq;
+ 
+ 	int prio, static_prio, normal_prio;
+@@ -1655,6 +1660,15 @@ struct task_struct {
+ 	unsigned int	sequential_io;
+ 	unsigned int	sequential_io_avg;
+ #endif
++#ifdef CONFIG_DEFERRED_SETPRIO
++	struct dprio_info *dprio_info;
++#endif
++#ifdef CONFIG_PUT_TASK_TIMEBOUND
++	struct work_struct put_task_work;
++#endif
++#ifdef CONFIG_DEBUG_DEFERRED_SETPRIO
++	bool in_dprio;
++#endif
+ };
+ 
+ /* Future-safe accessor for struct task_struct's cpus_allowed. */
+@@ -2195,6 +2209,11 @@ extern int sched_setscheduler_nocheck(struct task_struct *, int,
+ 				      const struct sched_param *);
+ extern int sched_setattr(struct task_struct *,
+ 			 const struct sched_attr *);
++extern int sched_setattr_precheck(struct task_struct *p,
++				  const struct sched_attr *attr);
++extern int sched_setattr_prechecked(struct task_struct *p,
++				    const struct sched_attr *attr,
++				    bool merge_reset_on_fork);
+ extern struct task_struct *idle_task(int cpu);
+ /**
+  * is_idle_task - is the specified task an idle task?
+diff --git a/linux-3.16.3/include/uapi/linux/Kbuild b/linux-3.16.3-dprio/include/uapi/linux/Kbuild
+index 24e9033..b602608 100644
+--- a/linux-3.16.3/include/uapi/linux/Kbuild
++++ b/linux-3.16.3-dprio/include/uapi/linux/Kbuild
+@@ -99,6 +99,7 @@ header-y += dlmconstants.h
+ header-y += dm-ioctl.h
+ header-y += dm-log-userspace.h
+ header-y += dn.h
++header-y += dprio_api.h
+ header-y += dqblk_xfs.h
+ header-y += edd.h
+ header-y += efs_fs_sb.h
+diff --git a/linux-3.16.3/include/uapi/linux/capability.h b/linux-3.16.3-dprio/include/uapi/linux/capability.h
+index 12c37a1..55c4bb0 100644
+--- a/linux-3.16.3/include/uapi/linux/capability.h
++++ b/linux-3.16.3-dprio/include/uapi/linux/capability.h
+@@ -351,8 +351,11 @@ struct vfs_cap_data {
+ 
+ #define CAP_AUDIT_READ		37
+ 
++/* Allow the use of deferred set priority (PR_SET_DEFERRED_SETPRIO) */
+ 
+-#define CAP_LAST_CAP         CAP_AUDIT_READ
++#define CAP_DPRIO	     38
++
++#define CAP_LAST_CAP         CAP_DPRIO
+ 
+ #define cap_valid(x) ((x) >= 0 && (x) <= CAP_LAST_CAP)
+ 
+diff --git a/linux-3.16.3-dprio/include/uapi/linux/dprio_api.h b/linux-3.16.3-dprio/include/uapi/linux/dprio_api.h
+new file mode 100644
+index 0000000..1748f40
+--- /dev/null
++++ b/linux-3.16.3-dprio/include/uapi/linux/dprio_api.h
+@@ -0,0 +1,137 @@
++/*
++ * Deferred set priority.
++ *
++ * This file contains the defitions for dprio(2) userspace-kernel interface.
++ */
++
++#ifndef _UAPI_LINUX_DPRIO_API_H
++#define _UAPI_LINUX_DPRIO_API_H
++
++#ifndef __KERNEL__
++  #include <linux/types.h>
++  #include <sched.h>
++#endif
++
++/*
++ * Userspace-kernel dprio protocol is as follows:
++ *
++ * Userspace:
++ *
++ *     Select and fill-in dprio_ku_area:
++ *         Set @resp = DPRIO_RESP_NONE.
++ *         Set @sched_attr.
++ *
++ *     Set @cmd to point dprio_ku_area.
++ *
++ *     @cmd is u64 variable previously designated in the call
++ *     prctl(PR_SET_DEFERRED_SETPRIO, & @cmd, ...)
++ *
++ * Kernel:
++ *
++ *     1) On task preemption attempt or at other processing point,
++ *        such as fork or exec, read @cmd.
++ *        If cannot (e.g. @cmd inaccessible incl. page swapped out), quit.
++ *        Note: will reattempt again on next preemption cycle.
++ *
++ *     2) If read-in value of @cmd is 0, do nothing. Quit.
++ *
++ *     3) Set @resp = DPRIO_RESP_UNKNOWN.
++ *        If cannot (e.g. inaccessible), quit.
++ *
++ *     4) Set @cmd = NULL.
++ *        If cannot (e.g. inaccessible), quit.
++ *        Note that in this case request handling will be reattempted on next
++ *        thread preemption cycle. Thus @resp value of DPRIO_RESP_UNKNOWN may
++ *        be transient and overwritten with DPRIO_RESP_OK or DPRIO_RESP_ERROR
++ *        if @cmd is not reset to 0 by the kernel (or to 0 or to the address
++ *        of another dprio_ku_area by the userspace).
++ *
++ *     5) Read @sched_attr.
++ *        If cannot (e.g. inaccessible), quit.
++ *
++ *     6) Try to change task scheduling attributes in accordance with read-in
++ *        value of @sched_attr.
++ *
++ *     7) If successful, set @resp = DPRIO_RESP_OK and Quit.
++ *
++ *     8) If unsuccessful, set @error = appopriate errno-style value.
++ *        If cannot (e.g. @error inaccessible), quit.
++ *        Set @resp = DPRIO_RESP_ERROR.
++ *        If cannot (e.g. @resp inaccessible), quit.
++ *
++ * Explanation of possible @resp codes:
++ *
++ * DPRIO_RESP_NONE
++ *
++ *     Request has not been processed yet.
++ *
++ * DPRIO_RESP_OK
++ *
++ *     Request has been successfully processed.
++ *
++ * DPRIO_RESP_ERROR
++ *
++ *     Request has failed, @error has errno-style error code.
++ *
++ * DPRIO_RESP_UNKNOWN
++ *
++ *     Request processing has been attempted, but the outcome is unknown.
++ *     Request might have been successful or failed.
++ *     Current os-level thread priority becomes unknown.
++ *
++ *     @error field may be invalid.
++ *
++ *     This code is written to @resp at the start of request processing,
++ *     then @resp is changed to OK or ERR at the end of request processing
++ *     if dprio_ku_area and @cmd stay accessible for write.
++ *
++ *     This status code is never left visible to the userspace code in the
++ *     current thread if dprio_ku_area and @cmd are locked in memory and remain
++ *     properly accessible for read and write during request processing.
++ *
++ *     This status code might happen (i.e. stay visible to userspace code
++ *     in the current thread) if access to dprio_ku_area or @cmd is lost
++ *     during request processing, for example the page that contains the area
++ *     gets swapped out or the area is otherwise not fully accessible for
++ *     reading and writing.
++ *
++ *     If @error has value of DPRIO_RESP_UNKNOWN and @cmd is still pointing
++ *     to dprio_ku_area containing @error, it is possible for the request to
++ *     be reprocessed again at the next context switch and @error change to
++ *     DPRIO_RESP_OK or DPRIO_RESP_ERROR. To ensure @error does not change
++ *     under your feet, change @cmd to either NULL or address of another
++ *     dprio_ku_area distinct from one containing this @error.
++ */
++enum {
++	DPRIO_RESP_NONE     = 0,
++	DPRIO_RESP_OK       = 1,
++	DPRIO_RESP_ERROR    = 2,
++	DPRIO_RESP_UNKNOWN  = 3
++};
++
++/*
++ * It is up to the client access methods whether it will want to define
++ * strucutre elements as volatile.
++ */
++#ifndef __dprio_volatile
++  #define __dprio_volatile
++#endif
++
++struct dprio_ku_area {
++	/*
++	 * Size of struct sched_attr may change in future definitions
++	 * of the structure, therefore @sched_attr should come after
++	 * @resp and @error in order to maintain the compatibility
++	 * between userland and kernel built with different versions
++	 * of struct sched_attr definition.
++	 *
++	 * Userland code should use volatile and/or compiler barriers
++	 * to ensure the protocol.
++	 */
++	__dprio_volatile __u32 resp;		/* DPRIO_RESP_xxx */
++	__dprio_volatile __u32 error;		/* one of errno values */
++	__dprio_volatile struct sched_attr sched_attr;
++};
++
++#endif /* _UAPI_LINUX_DPRIO_API_H */
++
+diff --git a/linux-3.16.3/include/uapi/linux/prctl.h b/linux-3.16.3-dprio/include/uapi/linux/prctl.h
+index 58afc04..3513db5 100644
+--- a/linux-3.16.3/include/uapi/linux/prctl.h
++++ b/linux-3.16.3-dprio/include/uapi/linux/prctl.h
+@@ -152,4 +152,6 @@
+ #define PR_SET_THP_DISABLE	41
+ #define PR_GET_THP_DISABLE	42
+ 
++#define PR_SET_DEFERRED_SETPRIO	43
++
+ #endif /* _LINUX_PRCTL_H */
+diff --git a/linux-3.16.3/init/Kconfig b/linux-3.16.3-dprio/init/Kconfig
+index 9d76b99..a8faee1 100644
+--- a/linux-3.16.3/init/Kconfig
++++ b/linux-3.16.3-dprio/init/Kconfig
+@@ -1905,3 +1905,5 @@ config ASN1
+ 	  functions to call on what tags.
+ 
+ source "kernel/Kconfig.locks"
++source "kernel/Kconfig.dprio"
++
+diff --git a/linux-3.16.3-dprio/kernel/Kconfig.dprio b/linux-3.16.3-dprio/kernel/Kconfig.dprio
+new file mode 100644
+index 0000000..c18f2d0
+--- /dev/null
++++ b/linux-3.16.3-dprio/kernel/Kconfig.dprio
+@@ -0,0 +1,68 @@
++menuconfig DEFERRED_SETPRIO
++	bool "Enable deferred setting of task priority"
++	default n
++	help
++	  Enabling this option allows authorized applications to use
++	  PR_SET_DEFERRED_SETPRIO request in prctl(2) system call.
++
++	  Applications that change task priority with very high frequency can
++	  benefit from using this facility as long as they are specifically
++	  implemented to use prctl(PR_SET_DEFERRED_SETPRIO). If the system does
++	  not intend to run such applications there is no benefit to using
++	  this option.
++
++	  The downside of selecting this option is a slightly increased latency
++	  in task switching only in the case when a deferred set priority request
++	  by a previous task is pending at task switch time. Added delay in task
++	  context switch in this case is in the order of 1 usec (typical time for
++	  executing deferred sched_setattr system call), which normally is not
++	  significant, but may be a consideration in a system intended for hard
++	  real-time use.
++
++	  If unsure, say N.
++
++if DEFERRED_SETPRIO
++
++config PUT_TASK_TIMEBOUND
++	bool "Deterministic task switch latency when deferred-set-task-priority is used"
++	depends on DEFERRED_SETPRIO && RT_MUTEXES
++	default n
++	help
++	  Enabling this option ensures deterministic time-bound task switch
++	  latency when a deferred set task priority request is pending on a
++	  task rescheduling and task switch, and the processing of this request
++	  causes an adjustment of priority inheritance chain under very low
++	  memory conditions (depleted atomic pool).
++
++	  Select Y when building the kernel for hard real-time system requiring
++	  the determinism in task switch latency. Select N for general-purpose
++	  desktop or server system.
++
++	  This option has memory cost of about 20-40 bytes per each running task
++	  in the system.
++
++config DEBUG_DEFERRED_SETPRIO
++	bool "Enable debugging code for deferred-set-task-priority"
++	depends on DEFERRED_SETPRIO
++	default n
++	help
++	  Enable debugging code for DEFERRED_SETPRIO.
++
++	  If unsure, say N.
++
++config DEFERRED_SETPRIO_PRIVILEGED
++	bool "Is deferred-set-task-priority a privileged operation"
++	depends on DEFERRED_SETPRIO
++	default y
++	help
++	  Define whether the deferred set task priority facility is accessible
++	  only for tasks having CAP_DPRIO capability or the facility is
++	  unprivileged and available to all users on the system. This option
++	  defines the initial value of the setting at system startup time but
++	  the setting can be altered later dynamically via
++	  /proc/sys/kernel/dprio_privileged.
++
++	  If unsure, say Y.
++
++endif # DEFERRED_SETPRIO
++
+diff --git a/linux-3.16.3/kernel/exit.c b/linux-3.16.3-dprio/kernel/exit.c
+index e5c4668..a9a19dd 100644
+--- a/linux-3.16.3/kernel/exit.c
++++ b/linux-3.16.3-dprio/kernel/exit.c
+@@ -53,6 +53,7 @@
+ #include <linux/oom.h>
+ #include <linux/writeback.h>
+ #include <linux/shm.h>
++#include <linux/dprio.h>
+ 
+ #include <asm/uaccess.h>
+ #include <asm/unistd.h>
+@@ -684,6 +685,11 @@ void do_exit(long code)
+ 
+ 	ptrace_event(PTRACE_EVENT_EXIT, code);
+ 
++	/*
++	 * No more deferred priority changes applied in __schedule for this task
++	 */
++	dprio_detach(tsk);
++
+ 	validate_creds_for_do_exit(tsk);
+ 
+ 	/*
+diff --git a/linux-3.16.3/kernel/fork.c b/linux-3.16.3-dprio/kernel/fork.c
+index 6a13c46..2d738f6 100644
+--- a/linux-3.16.3/kernel/fork.c
++++ b/linux-3.16.3-dprio/kernel/fork.c
+@@ -74,6 +74,7 @@
+ #include <linux/uprobes.h>
+ #include <linux/aio.h>
+ #include <linux/compiler.h>
++#include <linux/dprio.h>
+ 
+ #include <asm/pgtable.h>
+ #include <asm/pgalloc.h>
+@@ -234,7 +235,7 @@ static inline void put_signal_struct(struct signal_struct *sig)
+ 		free_signal_struct(sig);
+ }
+ 
+-void __put_task_struct(struct task_struct *tsk)
++static inline void __do_put_task_struct(struct task_struct *tsk)
+ {
+ 	WARN_ON(!tsk->exit_state);
+ 	WARN_ON(atomic_read(&tsk->usage));
+@@ -249,6 +250,84 @@ void __put_task_struct(struct task_struct *tsk)
+ 	if (!profile_handoff_task(tsk))
+ 		free_task(tsk);
+ }
++
++#ifdef CONFIG_PUT_TASK_TIMEBOUND
++/*
++ * If timebound, use preallocated struct work_struct always guaranteed
++ * to be available, even if atomic kmalloc pool is depleted.
++ */
++static inline struct work_struct *alloc_put_task_work(struct task_struct *tsk)
++{
++	return &tsk->put_task_work;
++}
++
++static inline void free_put_task_work(struct work_struct *work)
++{
++}
++
++static inline struct task_struct *put_task_work_tsk(struct work_struct *work)
++{
++	return container_of(work, struct task_struct, put_task_work);
++}
++#else
++struct put_task_work {
++	struct work_struct work;
++	struct task_struct *tsk;
++};
++
++static inline struct work_struct *alloc_put_task_work(struct task_struct *tsk)
++{
++	struct put_task_work *dwork =
++		kmalloc(sizeof(*dwork), GFP_NOWAIT | __GFP_NOWARN);
++	if (unlikely(!dwork))
++		return NULL;
++	dwork->tsk = tsk;
++	return &dwork->work;
++}
++
++static inline void free_put_task_work(struct work_struct *work)
++{
++	struct put_task_work *dwork =
++		container_of(work, struct put_task_work, work);
++	kfree(dwork);
++}
++
++static inline struct task_struct *put_task_work_tsk(struct work_struct *work)
++{
++	struct put_task_work *dwork =
++		container_of(work, struct put_task_work, work);
++	return dwork->tsk;
++}
++#endif
++
++#ifdef CONFIG_DEFERRED_SETPRIO
++static void __put_task_struct_work(struct work_struct *work)
++{
++	__do_put_task_struct(put_task_work_tsk(work));
++	free_put_task_work(work);
++}
++#endif
++
++void __put_task_struct(struct task_struct *tsk)
++{
++#ifdef CONFIG_DEFERRED_SETPRIO
++	/*
++	 * When called from inside of __schedule(), try to defer processing
++	 * to a worker thread, in order to mininize the scheduling latency
++	 * and make it deterministic.
++	 */
++	if (unlikely(preempt_count() & PREEMPT_ACTIVE)) {
++		struct work_struct *work = alloc_put_task_work(tsk);
++
++		if (likely(work)) {
++			INIT_WORK(work, __put_task_struct_work);
++			schedule_work(work);
++			return;
++		}
++	}
++#endif
++	__do_put_task_struct(tsk);
++}
+ EXPORT_SYMBOL_GPL(__put_task_struct);
+ 
+ void __init __weak arch_task_cache_init(void) { }
+@@ -314,6 +393,8 @@ static struct task_struct *dup_task_struct(struct task_struct *orig)
+ 	if (err)
+ 		goto free_ti;
+ 
++	dprio_dup_task_struct(tsk);
++
+ 	tsk->stack = ti;
+ 
+ 	setup_thread_stack(tsk, orig);
+@@ -1583,6 +1664,11 @@ long do_fork(unsigned long clone_flags,
+ 	long nr;
+ 
+ 	/*
++	 * Process pending "deferred set priority" request.
++	 */
++	dprio_handle_request();
++
++	/*
+ 	 * Determine whether and which event to report to ptracer.  When
+ 	 * called from kernel_thread or CLONE_UNTRACED is explicitly
+ 	 * requested, no event is reported; otherwise, report if the event
+diff --git a/linux-3.16.3/kernel/sched/Makefile b/linux-3.16.3-dprio/kernel/sched/Makefile
+index ab32b7b..a93d07c 100644
+--- a/linux-3.16.3/kernel/sched/Makefile
++++ b/linux-3.16.3-dprio/kernel/sched/Makefile
+@@ -19,3 +19,4 @@ obj-$(CONFIG_SCHED_AUTOGROUP) += auto_group.o
+ obj-$(CONFIG_SCHEDSTATS) += stats.o
+ obj-$(CONFIG_SCHED_DEBUG) += debug.o
+ obj-$(CONFIG_CGROUP_CPUACCT) += cpuacct.o
++obj-$(CONFIG_DEFERRED_SETPRIO) += dprio.o
+\ No newline at end of file
+diff --git a/linux-3.16.3/kernel/sched/core.c b/linux-3.16.3-dprio/kernel/sched/core.c
+index 0acf96b..48616d9 100644
+--- a/linux-3.16.3/kernel/sched/core.c
++++ b/linux-3.16.3-dprio/kernel/sched/core.c
+@@ -74,6 +74,7 @@
+ #include <linux/binfmts.h>
+ #include <linux/context_tracking.h>
+ #include <linux/compiler.h>
++#include <linux/dprio.h>
+ 
+ #include <asm/switch_to.h>
+ #include <asm/tlb.h>
+@@ -2691,6 +2692,111 @@ again:
+ 	BUG(); /* the idle class will always have a runnable task */
+ }
+ 
++#ifdef CONFIG_DEFERRED_SETPRIO
++
++/*
++ * __schedule should never be reentered recursively while it is handling
++ * deferred change priority request in dprio_set_schedattr, i.e. when
++ * @prev->in_dprio is true.
++ *
++ * To prevent reenterancy, dprio_handle_request(...) keeps preemption
++ * disable counter non-zero and also sets PREEMPT_ACTIVE flag.
++ */
++static __always_inline bool dprio_sched_recursion(struct task_struct *prev)
++{
++#ifdef CONFIG_DEBUG_DEFERRED_SETPRIO
++	if (unlikely(prev->in_dprio)) {
++		WARN_ONCE(1, KERN_ERR "BUG: dprio recursion in __schedule\n");
++
++		prev->state = TASK_RUNNING;
++		clear_tsk_need_resched(prev);
++		clear_preempt_need_resched();
++		sched_preempt_enable_no_resched();
++
++		return true;
++	}
++#endif /* CONFIG_DEBUG_DEFERRED_SETPRIO */
++
++	return false;
++}
++
++/*
++ * Check if deferred change priority request from the userland is pending
++ * and if so, handle it.
++ *
++ *     Academically speaking, it would be desirable (instead of calling
++ *     dprio_set_schedattr *before* pick_next_task) to call it *after*
++ *     pick_next_task and only if (next != prev). However in practice this
++ *     would save at most one sched_setattr call per task scheduling interval
++ *     (only for the tasks that use dprio), and then only sometimes, only when
++ *     both dprio request is pending at rescheduling time and the task gets
++ *     actually preempted by another task. At typical values of Linux scheduling
++ *     parameters and the cost of sched_setattr call this translates to an
++ *     additional possible saving for dprio tasks that is well under 0.1%,
++ *     and probably much lower.
++ *
++ *     Nevertheless if dprio_set_schedattr were ever to be moved after the call
++ *     to pick_next_task, existing class schedulers would need to be revised
++ *     to support, in addition to call sequence
++ *
++ *       [pick_next_task] [context_switch]
++ *
++ *     also the sequence
++ *
++ *       [pick_next_task] [unlock rq] [...] [lock rq] [pick_next_task] [context_switch]
++ *
++ *     where [...] may include a bunch of intervening class scheduler method
++ *     calls local CPU and other CPUs, since we'd be giving up the rq lock.
++ *     This would require splitting pick_next_task into "prepare" and
++ *     "commit/abort" phases.
++ */
++static __always_inline void dprio_sched_handle_request(struct task_struct *prev)
++{
++	if (unlikely(prev->dprio_ku_area_pp != NULL) &&
++	    unlikely(dprio_check_for_request(prev))) {
++		int sv_pc;
++
++		/*
++		 * Do not attempt to process "deferred set priority" request for
++		 * TASK_DEAD, STOPPED, TRACED and other states where it won't be
++		 * appropriate.
++		 */
++		switch (prev->state) {
++		case TASK_RUNNING:
++		case TASK_INTERRUPTIBLE:
++		case TASK_UNINTERRUPTIBLE:
++			break;
++		default:
++			return;
++		}
++
++		sv_pc = preempt_count();
++		if (!(sv_pc & PREEMPT_ACTIVE))
++			__preempt_count_add(PREEMPT_ACTIVE);
++		set_task_in_dprio(prev, true);
++		/*
++		 * Keep preemption disabled to avoid __schedule() recursion.
++		 * In addition PREEMPT_ACTIVE notifies dprio_handle_request()
++		 * and routines that may be called from inside of it, such as
++		 * __put_task_struct(), of the calling context.
++		 */
++		dprio_handle_request();
++
++		set_task_in_dprio(prev, false);
++		if (!(sv_pc & PREEMPT_ACTIVE))
++			__preempt_count_sub(PREEMPT_ACTIVE);
++	}
++}
++#else  /* !defined CONFIG_DEFERRED_SETPRIO */
++
++static __always_inline bool dprio_sched_recursion(struct task_struct *prev)
++	{ return false; }
++
++static __always_inline void dprio_sched_handle_request(struct task_struct *prev)
++	{}
++
++#endif  /* CONFIG_DEFERRED_SETPRIO */
++
+ /*
+  * __schedule() is the main scheduler function.
+  *
+@@ -2744,6 +2850,10 @@ need_resched:
+ 
+ 	schedule_debug(prev);
+ 
++	if (dprio_sched_recursion(prev))
++		return;
++	dprio_sched_handle_request(prev);
++
+ 	if (sched_feat(HRTICK))
+ 		hrtick_clear(rq);
+ 
+@@ -3317,9 +3427,31 @@ static bool check_same_owner(struct task_struct *p)
+ 	return match;
+ }
+ 
++/*
++ * Flags for _sched_setscheduler and __sched_setscheduler:
++ *
++ *     SCHEDOP_KERNEL		on behalf of the kernel
++ *     SCHEDOP_USER		on behalf of the userspace
++ *
++ *     SCHEDOP_PRECHECK_ONLY	precheck security only, do not
++ *				actually change priority
++ *     SCHEDOP_PRECHECKED	security has been prechecked
++ *
++ *     SCHEDOP_MERGE_RESET_ON_FORK  use logical "or" of
++ *				attr->sched_flags & SCHED_FLAG_RESET_ON_FORK
++ *				and p->sched_reset_on_fork
++ *
++ * SCHEDOP_KERNEL and SCHEDOP_USER are mutually exclusive.
++ */
++#define SCHEDOP_KERNEL			(1 << 0)
++#define SCHEDOP_USER			(1 << 1)
++#define SCHEDOP_PRECHECK_ONLY		(1 << 2)
++#define SCHEDOP_PRECHECKED		(1 << 3)
++#define SCHEDOP_MERGE_RESET_ON_FORK	(1 << 4)
++
+ static int __sched_setscheduler(struct task_struct *p,
+ 				const struct sched_attr *attr,
+-				bool user)
++				int opflags)
+ {
+ 	int newprio = dl_policy(attr->sched_policy) ? MAX_DL_PRIO - 1 :
+ 		      MAX_RT_PRIO - 1 - attr->sched_priority;
+@@ -3329,9 +3461,13 @@ static int __sched_setscheduler(struct task_struct *p,
+ 	const struct sched_class *prev_class;
+ 	struct rq *rq;
+ 	int reset_on_fork;
++	bool check_security;
+ 
+ 	/* may grab non-irq protected spin_locks */
+ 	BUG_ON(in_interrupt());
++
++	check_security = (opflags & SCHEDOP_USER) && !(opflags & SCHEDOP_PRECHECKED);
++
+ recheck:
+ 	/* double check policy once rq lock held */
+ 	if (policy < 0) {
+@@ -3339,6 +3475,8 @@ recheck:
+ 		policy = oldpolicy = p->policy;
+ 	} else {
+ 		reset_on_fork = !!(attr->sched_flags & SCHED_FLAG_RESET_ON_FORK);
++		if (opflags & SCHEDOP_MERGE_RESET_ON_FORK)
++			reset_on_fork |= p->sched_reset_on_fork;
+ 
+ 		if (policy != SCHED_DEADLINE &&
+ 				policy != SCHED_FIFO && policy != SCHED_RR &&
+@@ -3365,7 +3503,7 @@ recheck:
+ 	/*
+ 	 * Allow unprivileged RT tasks to decrease priority:
+ 	 */
+-	if (user && !capable(CAP_SYS_NICE)) {
++	if (check_security && !capable(CAP_SYS_NICE)) {
+ 		if (fair_policy(policy)) {
+ 			if (attr->sched_nice < task_nice(p) &&
+ 			    !can_nice(p, attr->sched_nice))
+@@ -3413,7 +3551,7 @@ recheck:
+ 			return -EPERM;
+ 	}
+ 
+-	if (user) {
++	if (check_security) {
+ 		retval = security_task_setscheduler(p);
+ 		if (retval)
+ 			return retval;
+@@ -3448,13 +3586,17 @@ recheck:
+ 		if (dl_policy(policy))
+ 			goto change;
+ 
+-		p->sched_reset_on_fork = reset_on_fork;
++		if (!(opflags & SCHEDOP_PRECHECK_ONLY)) {
++			if (opflags & SCHEDOP_MERGE_RESET_ON_FORK)
++				reset_on_fork |= p->sched_reset_on_fork;
++			p->sched_reset_on_fork = reset_on_fork;
++		}
+ 		task_rq_unlock(rq, p, &flags);
+ 		return 0;
+ 	}
+ change:
+ 
+-	if (user) {
++	if (opflags & SCHEDOP_USER) {
+ #ifdef CONFIG_RT_GROUP_SCHED
+ 		/*
+ 		 * Do not allow realtime tasks into groups that have no runtime
+@@ -3502,6 +3644,13 @@ change:
+ 		return -EBUSY;
+ 	}
+ 
++	if (opflags & SCHEDOP_PRECHECK_ONLY) {
++		task_rq_unlock(rq, p, &flags);
++		return 0;
++	}
++
++	if (opflags & SCHEDOP_MERGE_RESET_ON_FORK)
++		reset_on_fork |= p->sched_reset_on_fork;
+ 	p->sched_reset_on_fork = reset_on_fork;
+ 	oldprio = p->prio;
+ 
+@@ -3549,7 +3698,7 @@ change:
+ }
+ 
+ static int _sched_setscheduler(struct task_struct *p, int policy,
+-			       const struct sched_param *param, bool check)
++			       const struct sched_param *param, int opflags)
+ {
+ 	struct sched_attr attr = {
+ 		.sched_policy   = policy,
+@@ -3567,7 +3716,7 @@ static int _sched_setscheduler(struct task_struct *p, int policy,
+ 		attr.sched_policy = policy;
+ 	}
+ 
+-	return __sched_setscheduler(p, &attr, check);
++	return __sched_setscheduler(p, &attr, opflags);
+ }
+ /**
+  * sched_setscheduler - change the scheduling policy and/or RT priority of a thread.
+@@ -3582,16 +3731,42 @@ static int _sched_setscheduler(struct task_struct *p, int policy,
+ int sched_setscheduler(struct task_struct *p, int policy,
+ 		       const struct sched_param *param)
+ {
+-	return _sched_setscheduler(p, policy, param, true);
++	return _sched_setscheduler(p, policy, param, SCHEDOP_USER);
+ }
+ EXPORT_SYMBOL_GPL(sched_setscheduler);
+ 
+ int sched_setattr(struct task_struct *p, const struct sched_attr *attr)
+ {
+-	return __sched_setscheduler(p, attr, true);
++	return __sched_setscheduler(p, attr, SCHEDOP_USER);
+ }
+ EXPORT_SYMBOL_GPL(sched_setattr);
+ 
++/*
++ * Check for security context required to execute sched_setattr,
++ * but do not execute actual task scheduler properties setting.
++ */
++int sched_setattr_precheck(struct task_struct *p, const struct sched_attr *attr)
++{
++	return __sched_setscheduler(p, attr, SCHEDOP_USER |
++					     SCHEDOP_PRECHECK_ONLY);
++}
++EXPORT_SYMBOL_GPL(sched_setattr_precheck);
++
++/*
++ * Execute sched_setattr bypassing security checks.
++ */
++int sched_setattr_prechecked(struct task_struct *p,
++			     const struct sched_attr *attr,
++			     bool merge_reset_on_fork)
++{
++	int exflags = merge_reset_on_fork ? SCHEDOP_MERGE_RESET_ON_FORK : 0;
++
++	return __sched_setscheduler(p, attr, SCHEDOP_USER |
++					     SCHEDOP_PRECHECKED |
++					     exflags);
++}
++EXPORT_SYMBOL_GPL(sched_setattr_prechecked);
++
+ /**
+  * sched_setscheduler_nocheck - change the scheduling policy and/or RT priority of a thread from kernelspace.
+  * @p: the task in question.
+@@ -3608,7 +3783,7 @@ EXPORT_SYMBOL_GPL(sched_setattr);
+ int sched_setscheduler_nocheck(struct task_struct *p, int policy,
+ 			       const struct sched_param *param)
+ {
+-	return _sched_setscheduler(p, policy, param, false);
++	return _sched_setscheduler(p, policy, param, SCHEDOP_KERNEL);
+ }
+ 
+ static int
+diff --git a/linux-3.16.3-dprio/kernel/sched/dprio.c b/linux-3.16.3-dprio/kernel/sched/dprio.c
+new file mode 100644
+index 0000000..94cec5f
+--- /dev/null
++++ b/linux-3.16.3-dprio/kernel/sched/dprio.c
+@@ -0,0 +1,617 @@
++/*
++ * kernel/sched/dprio.c
++ *
++ * Deferred set priority.
++ *
++ * Started by (C) 2014 Sergey Oboguev <oboguev@yahoo.com>
++ *
++ * This code is licenced under the GPL version 2 or later.
++ * For details see linux-kernel-base/COPYING.
++ */
++
++#include <linux/types.h>
++#include <linux/unistd.h>
++#include <linux/stddef.h>
++#include <linux/errno.h>
++#include <linux/kernel.h>
++#include <linux/sched.h>
++#include <linux/dprio.h>
++#include <linux/dprio_api.h>
++#include <linux/slab.h>
++#include <linux/compiler.h>
++#include <linux/uaccess.h>
++#include <linux/capability.h>
++#include <linux/prctl.h>
++#include <linux/init.h>
++
++unsigned int dprio_privileged = DPRIO_PRIVILEGED_INITIAL_VALUE;
++
++/*
++ * Returns 0 on success.
++ */
++static inline int __copyin(void *dst, const void __user *src,
++			   unsigned size, bool atomic)
++{
++	int ret;
++
++	/* Use barrier() to sequence userspace-kernel dprio protocol */
++	barrier();
++	if (atomic) {
++		pagefault_disable();
++		ret = __copy_from_user_inatomic(dst, src, size);
++		pagefault_enable();
++	} else {
++		ret = copy_from_user(dst, src, size);
++	}
++	barrier();
++
++	return ret;
++}
++
++/*
++ * Returns 0 on success.
++ */
++static inline int __copyout(void __user *dst, const void *src,
++			    unsigned size, bool atomic)
++{
++	int ret;
++
++	/* Use barrier() to sequence userspace-kernel dprio protocol */
++	barrier();
++	if (atomic) {
++		pagefault_disable();
++		ret = __copy_to_user_inatomic(dst, src, size);
++		pagefault_enable();
++	} else {
++		ret = copy_to_user(dst, src, size);
++	}
++	barrier();
++
++	return ret;
++}
++
++#define __copyin_var(x, uptr, atomic)	\
++	__copyin(&(x), (uptr), sizeof(x), (atomic))
++
++#define __copyout_var(x, uptr, atomic)	\
++	__copyout((uptr), &(x), sizeof(x), (atomic))
++
++
++/*
++ * Mimics sched_copy_attr()
++ */
++#define CHUNK_SIZE 32u
++static int dprio_copyin_sched_attr(struct sched_attr __user *uattr,
++				   struct sched_attr *attr,
++				   bool atomic)
++{
++	u32 size;
++
++	if (!access_ok(VERIFY_READ, uattr, SCHED_ATTR_SIZE_VER0))
++		return -EFAULT;
++
++	/*
++	 * zero the full structure, so that a short copy will be nice.
++	 */
++	memset(attr, 0, sizeof(*attr));
++
++	if (__copyin_var(size, &uattr->size, atomic))
++		return -EFAULT;
++
++	if (size > PAGE_SIZE)	/* silly large */
++		return -E2BIG;
++
++	if (!size)		/* abi compat */
++		size = SCHED_ATTR_SIZE_VER0;
++
++	if (size < SCHED_ATTR_SIZE_VER0)
++		return -E2BIG;
++
++	/*
++	 * If we're handed a bigger struct than we know of,
++	 * ensure all the unknown bits are 0 - i.e. new
++	 * user-space does not rely on any kernel feature
++	 * extensions we dont know about yet.
++	 */
++	if (size > sizeof(*attr)) {
++		unsigned char __user *addr;
++		unsigned char __user *end;
++		unsigned char val[CHUNK_SIZE];
++		unsigned k, chunk_size;
++
++		addr = (char __user *)uattr + sizeof(*attr);
++		end  = (char __user *)uattr + size;
++
++		for (; addr < end; addr += chunk_size) {
++			chunk_size = min((unsigned) (end - addr), CHUNK_SIZE);
++			if (__copyin(val, addr, chunk_size, atomic))
++				return -EFAULT;
++			for (k = 0;  k < chunk_size; k++) {
++				if (val[k])
++					return -E2BIG;
++			}
++		}
++		size = sizeof(*attr);
++	}
++
++	if (__copyin(attr, uattr, size, atomic))
++		return -EFAULT;
++
++	attr->size = size;
++
++	/*
++	 * XXX: do we want to be lenient like existing syscalls; or do we want
++	 * to be strict and return an error on out-of-bounds values?
++	 * See also other uses of clamp(..., MIN_NICE, MAX_NICE) below.
++	 */
++	attr->sched_nice = clamp(attr->sched_nice, MIN_NICE, MAX_NICE);
++
++	return 0;
++}
++
++
++/*
++ * Detach the task from userland deferred setprio request area and deallocate
++ * all resources for the connection. Called from:
++ *
++ *   - prctl(PR_SET_DEFERRED_SETPRIO) with area argument passed as NULL
++ *     to terminate previous connection
++ *
++ *   - prctl(PR_SET_DEFERRED_SETPRIO) with new non-NULL area argument
++ *     setting new connection. Previous connection is terminated before
++ *     establishing a new one
++ *
++ *   - when the task is terminated in do_exit()
++ */
++void dprio_detach(struct task_struct *tsk)
++{
++	preempt_disable();
++
++	tsk->dprio_ku_area_pp = NULL;
++
++	if (unlikely(tsk->dprio_info)) {
++		kfree(tsk->dprio_info);
++		tsk->dprio_info = NULL;
++	}
++
++	preempt_enable();
++}
++
++/*
++ * Pre-process sched_attr just read from the userspace, whether during precheck
++ * or during dprio request execution, to impose uniform interpretation of
++ * structure format and values.
++ */
++static void uniform_attr(struct sched_attr *attr)
++{
++	/* accommodate legacy hack */
++	if ((attr->sched_policy & SCHED_RESET_ON_FORK) &&
++	    attr->sched_policy != -1) {
++		attr->sched_flags |= SCHED_FLAG_RESET_ON_FORK;
++		attr->sched_policy &= ~SCHED_RESET_ON_FORK;
++	}
++
++	if (attr->sched_policy == SCHED_IDLE)
++		attr->sched_nice = MAX_NICE;
++}
++
++/*
++ * Precheck whether current process is authorized to set its scheduling
++ * properties to @uattr. If yes, make record in @info and return 0.
++ * If not, return error.
++ */
++static int precheck(struct dprio_info *info, struct sched_attr __user *uattr)
++{
++	struct sched_attr attr;
++	u32 policy;
++	unsigned mask;
++	int error;
++
++	error = dprio_copyin_sched_attr(uattr, &attr, false);
++	if (error)
++		return error;
++
++	uniform_attr(&attr);
++
++	policy = attr.sched_policy;
++	mask = 1 << policy;
++
++	switch (policy) {
++	case SCHED_NORMAL:
++		attr.sched_nice = clamp(attr.sched_nice, MIN_NICE, MAX_NICE);
++		if ((info->mask & mask) &&
++		    attr.sched_nice >= info->normal_sched_nice)
++			break;
++		error = sched_setattr_precheck(current, &attr);
++		if (error == 0) {
++			info->normal_sched_nice = attr.sched_nice;
++			info->mask |= mask;
++		}
++		break;
++
++	case SCHED_BATCH:
++		attr.sched_nice = clamp(attr.sched_nice, MIN_NICE, MAX_NICE);
++		if ((info->mask & mask) &&
++		    attr.sched_nice >= info->batch_sched_nice)
++			break;
++		error = sched_setattr_precheck(current, &attr);
++		if (error == 0) {
++			info->batch_sched_nice = attr.sched_nice;
++			info->mask |= mask;
++		}
++		break;
++
++	case SCHED_FIFO:
++		if ((info->mask & mask) &&
++		    attr.sched_priority <= info->fifo_sched_priority)
++			break;
++		error = sched_setattr_precheck(current, &attr);
++		if (error == 0) {
++			info->fifo_sched_priority = attr.sched_priority;
++			info->mask |= mask;
++		}
++		break;
++
++	case SCHED_RR:
++		if ((info->mask & mask) &&
++		    attr.sched_priority <= info->rr_sched_priority)
++			break;
++		error = sched_setattr_precheck(current, &attr);
++		if (error == 0) {
++			info->rr_sched_priority = attr.sched_priority;
++			info->mask |= mask;
++		}
++		break;
++
++	case SCHED_IDLE:
++		if (info->mask & mask)
++			break;
++		error = sched_setattr_precheck(current, &attr);
++		if (error == 0)
++			info->mask |= mask;
++		break;
++
++	case SCHED_DEADLINE:
++		/*
++		 * DL is not a meaningful policy for deferred set
++		 * priority
++		 */
++	default:
++		error = -EINVAL;
++		break;
++	}
++
++	return error;
++}
++
++/*
++ * Implements prctl(PR_SET_DEFERRED_SETPRIO).
++ *
++ * To set PR_SET_DEFERRED_SETPRIO:
++ *
++ *     a2 = address of u64 variable in the userspace that holds the pointer
++ *          to dprio_ku_area or NULL
++ *
++ *     a3 = address of userspace array of pointers to sched_attr entries
++ *          to preapprove for subsequent pre-checked use by deferred set
++ *          priority requests
++ *
++ *     a4 = count of entries in a3 or 0
++ *
++ *     a5 = 0
++ *
++ * To reset PR_SET_DEFERRED_SETPRIO:
++ *
++ *     a2 = 0
++ *     a3 = 0
++ *     a4 = 0
++ *     a5 = 0
++ *
++ * Thus valid calls are:
++ *
++ *     struct sched_attr **sched_attrs_pp;
++ *     prctl(PR_SET_DEFERRED_SETPRIO, dprio_ku_area_pp,
++ *           sched_attrs_pp, nattrs, 0)
++ *
++ *     prctl(PR_SET_DEFERRED_SETPRIO, NULL, NULL, 0, 0)
++ *
++ */
++long dprio_prctl(int option, unsigned long a2, unsigned long a3,
++		 unsigned long a4, unsigned long a5)
++{
++	struct dprio_ku_area __user * __user *ku_area_pp;
++	struct dprio_ku_area __user *ku_area_p;
++	struct dprio_info *info = NULL;
++	unsigned long ne, nentries;
++	struct sched_attr __user * __user *uattr_pp;
++	struct sched_attr __user *uattr_p;
++	bool atomic = false;
++	long error = 0;
++
++	if (option != PR_SET_DEFERRED_SETPRIO)
++		return -EINVAL;
++
++	ku_area_pp = (struct dprio_ku_area __user * __user *) a2;
++
++	/*
++	* Handle reset operation for PR_SET_DEFERRED_SETPRIO
++	 */
++	if (ku_area_pp == NULL) {
++		if (a3 | a4 | a5)
++			return -EINVAL;
++		dprio_handle_request();
++		dprio_detach(current);
++		return 0;
++	}
++
++	/*
++	 * Handle set operation for PR_SET_DEFERRED_SETPRIO
++	 */
++	uattr_pp = (struct sched_attr __user * __user *) a3;
++	nentries = a4;
++	if (a5)
++		return -EINVAL;
++
++	/* sanity check to avoid long spinning in the kernel */
++	if (nentries > 4096) {
++		error = -EINVAL;
++		goto out;
++	}
++
++	/* Check alignment */
++	if ((unsigned long) ku_area_pp % sizeof(u64))
++		return  -EINVAL;
++
++	/* check *ku_area_pp is readable and writeable */
++	if (__copyin_var(ku_area_p, ku_area_pp, atomic) ||
++	    __copyout_var(ku_area_p, ku_area_pp, atomic))
++		return  -EFAULT;
++
++	error = dprio_check_permission();
++	if (error)
++		return error;
++
++	info = kmalloc(sizeof(*info), GFP_KERNEL);
++	if (info == NULL)
++		return -ENOMEM;
++	info->mask = 0;
++	/*
++	 * XXX:
++	 *
++	 * We may trigger a false recording of PF_SUPERPRIV here by requesting
++	 * CAP_SYS_NICE capability we may not actually use later, however
++	 * since we cannot modify current->flags during dprio_handle_request()
++	 * when called from __schedule(), the alternatives would be either
++	 * possibly missing the recording of PF_SUPERPRIV, or (better) splitting
++	 * PF_SUPERPRIV from current->flags and moving it to a variable with
++	 * atomic access protocol.
++	 */
++	info->capable_sys_nice = capable(CAP_SYS_NICE);
++
++	/*
++	 * We prevalidate maximum requested priority levels at the time of
++	 * prctl set-up instead of validating priority change requests during
++	 * their actual processing in __schedule and do_fork in order to:
++	 *
++	 *    - reduce latency during request processing in __schedule()
++	 *
++	 *    - avoid blocking in the secirity code when setprio processing
++	 *      is performed in _schedule()
++	 *
++	 *    - avoid EINTR or ERESTARTSYS etc. that may be returned by
++	 *      the security code during setprio request processing
++	 */
++	for (ne = 0;  ne < nentries;  ne++) {
++		cond_resched();
++		if (__copyin_var(uattr_p, uattr_pp + ne, atomic)) {
++			error = -EFAULT;
++			goto out;
++		}
++		error = precheck(info, uattr_p);
++		if (error)
++			goto out;
++	}
++
++	/*
++	 * If there was a previous active dprio ku area, try to process
++	 * any pending request in it and detach from it.
++	 */
++	dprio_handle_request();
++	dprio_detach(current);
++
++	preempt_disable();
++	current->dprio_ku_area_pp = ku_area_pp;
++	current->dprio_info = info;
++	preempt_enable();
++
++out:
++	if (error && info)
++		kfree(info);
++
++	return error;
++}
++
++/*
++ * Check if "deferred set priority" request from the userland is pending.
++ * Returns @true if request has been detected, @false if not.
++ *
++ * If page pointed by dprio_ku_area_pp is not currently accessible (e.g. not
++ * valid or paged out), return @false.
++ */
++bool dprio_check_for_request(struct task_struct *prev)
++{
++	struct dprio_ku_area __user *ku_area_p;
++	bool atomic = true;
++
++#ifdef CONFIG_DEBUG_DEFERRED_SETPRIO
++	/*
++	 * We are only called if prev->dprio_ku_area_pp != NULL,
++	 * thus prev cannot be a kernel thread
++	 */
++	if (unlikely(prev->active_mm != prev->mm)) {
++		WARN_ONCE(1, KERN_ERR "BUG: dprio: address space not mapped\n");
++		return false;
++	}
++#endif /* CONFIG_DEBUG_DEFERRED_SETPRIO */
++
++	if (__copyin_var(ku_area_p, prev->dprio_ku_area_pp, atomic))
++		return false;
++
++	return ku_area_p != NULL;
++}
++
++/*
++ * Handle pending "deferred set priority" request from the userland.
++ */
++void dprio_handle_request(void)
++{
++	struct dprio_ku_area __user *ku;
++	struct dprio_ku_area __user *ku_null;
++	struct sched_attr attr;
++	bool atomic;
++	u32 resp, error;
++	int ierror = 0;
++	unsigned long rlim_rtprio;
++	long rlim_nice;
++	struct dprio_info *info;
++
++	/* attached to ku area? */
++	if (current->dprio_ku_area_pp == NULL)
++		return;
++
++	/* called from __schedule? */
++	atomic = preempt_count() != 0;
++
++	/* fetch ku request area address from the userspace */
++	if (__copyin_var(ku, current->dprio_ku_area_pp, atomic))
++		return;
++
++	/* check if request is pending */
++	if (unlikely(ku == NULL))
++		return;
++
++	/* remark to the userspace:
++	   request processing has been started/attempted */
++	resp = DPRIO_RESP_UNKNOWN;
++	if (__copyout_var(resp, &ku->resp, atomic))
++		return;
++
++	/* reset pending request */
++	ku_null = NULL;
++	if (__copyout_var(ku_null, current->dprio_ku_area_pp, atomic))
++		return;
++
++	/* fetch request parameters from the userspace */
++	if (dprio_copyin_sched_attr(&ku->sched_attr, &attr, atomic))
++		return;
++
++	/* impose uniform interpretation of sched_attr */
++	uniform_attr(&attr);
++
++	if (attr.sched_flags & ~SCHED_FLAG_RESET_ON_FORK) {
++		ierror = -EINVAL;
++		goto out;
++	}
++
++	/*
++	 * check if request has been pre-authorized
++	 */
++	info = current->dprio_info;
++	switch (attr.sched_policy) {
++	case SCHED_NORMAL:
++		if (!(info->mask & (1 << SCHED_NORMAL)) ||
++		    attr.sched_nice < info->normal_sched_nice)
++			ierror = -EPERM;
++		/*
++		 * check whether RLIMIT_NICE has been reduced
++		 * by setrlimit or prlimit
++		 */
++		if (ierror == 0 && !info->capable_sys_nice) {
++			rlim_nice = 20 - task_rlimit(current, RLIMIT_NICE);
++			if (attr.sched_nice < rlim_nice)
++				ierror = -EPERM;
++		}
++		break;
++
++	case SCHED_BATCH:
++		if (!(info->mask & (1 << SCHED_BATCH)) ||
++		    attr.sched_nice < info->batch_sched_nice)
++			ierror = -EPERM;
++		/*
++		 * check whether RLIMIT_NICE has been reduced
++		 * by setrlimit or prlimit
++		 */
++		if (ierror == 0 && !info->capable_sys_nice) {
++			rlim_nice = 20 - task_rlimit(current, RLIMIT_NICE);
++			if (attr.sched_nice < rlim_nice)
++				ierror = -EPERM;
++		}
++		break;
++
++	case SCHED_FIFO:
++		if (!(info->mask & (1 << SCHED_FIFO)) ||
++		    attr.sched_priority > info->fifo_sched_priority)
++			ierror = -EPERM;
++		/*
++		 * check whether RLIMIT_RTPRIO has been reduced
++		 * by setrlimit or prlimit
++		 */
++		if (ierror == 0 && !info->capable_sys_nice) {
++			rlim_rtprio = task_rlimit(current, RLIMIT_RTPRIO);
++			if (rlim_rtprio == 0 || attr.sched_priority > rlim_rtprio)
++				ierror = -EPERM;
++		}
++		break;
++
++	case SCHED_RR:
++		if (!(info->mask & (1 << SCHED_RR)) ||
++		    attr.sched_priority > info->rr_sched_priority)
++			ierror = -EPERM;
++		/*
++		 * check whether RLIMIT_RTPRIO has been reduced
++		 * by setrlimit or prlimit
++		 */
++		if (ierror == 0 && !info->capable_sys_nice) {
++			rlim_rtprio = task_rlimit(current, RLIMIT_RTPRIO);
++			if (rlim_rtprio == 0 || attr.sched_priority > rlim_rtprio)
++				ierror = -EPERM;
++		}
++		break;
++
++	case SCHED_IDLE:
++		if (!(info->mask & (1 << SCHED_IDLE)))
++			ierror = -EPERM;
++		break;
++
++	default:
++		ierror = -EINVAL;
++		break;
++	}
++
++	/* execute the request */
++	if (ierror == 0)
++		ierror = sched_setattr_prechecked(current, &attr, true);
++
++out:
++	if (ierror) {
++		error = (u32) -ierror;
++		resp = DPRIO_RESP_ERROR;
++		if (0 == __copyout_var(error, &ku->error, atomic))
++			__copyout_var(resp, &ku->resp, atomic);
++	} else {
++		resp = DPRIO_RESP_OK;
++		__copyout_var(resp, &ku->resp, atomic);
++	}
++}
++
++/*
++ * Verify if the current task is authorized to use prctl(PR_SET_DEFERRED_SETPRIO).
++ */
++int dprio_check_permission(void)
++{
++	if (dprio_privileged && !capable(CAP_DPRIO))
++		return -EPERM;
++
++	return 0;
++}
++
+diff --git a/linux-3.16.3/kernel/sys.c b/linux-3.16.3-dprio/kernel/sys.c
+index 66a751e..6584f86 100644
+--- a/linux-3.16.3/kernel/sys.c
++++ b/linux-3.16.3-dprio/kernel/sys.c
+@@ -52,6 +52,7 @@
+ #include <linux/rcupdate.h>
+ #include <linux/uidgid.h>
+ #include <linux/cred.h>
++#include <linux/dprio.h>
+ 
+ #include <linux/kmsg_dump.h>
+ /* Move somewhere else to avoid recompiling? */
+@@ -2011,6 +2012,11 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
+ 			me->mm->def_flags &= ~VM_NOHUGEPAGE;
+ 		up_write(&me->mm->mmap_sem);
+ 		break;
++#ifdef CONFIG_DEFERRED_SETPRIO
++	case PR_SET_DEFERRED_SETPRIO:
++		error = dprio_prctl(option, arg2, arg3, arg4, arg5);
++		break;
++#endif
+ 	default:
+ 		error = -EINVAL;
+ 		break;
+diff --git a/linux-3.16.3/kernel/sysctl.c b/linux-3.16.3-dprio/kernel/sysctl.c
+index 75b22e2..236ad62 100644
+--- a/linux-3.16.3/kernel/sysctl.c
++++ b/linux-3.16.3-dprio/kernel/sysctl.c
+@@ -63,6 +63,7 @@
+ #include <linux/binfmts.h>
+ #include <linux/sched/sysctl.h>
+ #include <linux/kexec.h>
++#include <linux/dprio.h>
+ 
+ #include <asm/uaccess.h>
+ #include <asm/processor.h>
+@@ -432,6 +433,17 @@ static struct ctl_table kern_table[] = {
+ 		.extra2		= &one,
+ 	},
+ #endif
++#ifdef CONFIG_DEFERRED_SETPRIO
++	{
++		.procname	= "dprio_privileged",
++		.data		= &dprio_privileged,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= &zero,
++		.extra2		= &one,
++	},
++#endif
+ #ifdef CONFIG_CFS_BANDWIDTH
+ 	{
+ 		.procname	= "sched_cfs_bandwidth_slice_us",

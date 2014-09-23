@@ -152,4 +152,6 @@
 #define PR_SET_THP_DISABLE	41
 #define PR_GET_THP_DISABLE	42
 
+#define PR_SET_DEFERRED_SETPRIO	43
+
 #endif /* _LINUX_PRCTL_H */

@@ -30,6 +30,7 @@ show up in /proc/sys/kernel:
 - core_uses_pid
 - ctrl-alt-del
 - dmesg_restrict
+- dprio_privileged
 - domainname
 - hostname
 - hotplug
@@ -264,6 +265,19 @@ dmesg(8).
 
 The kernel config option CONFIG_SECURITY_DMESG_RESTRICT sets the
 default value of dmesg_restrict.
+
+==============================================================
+
+dprio_privileged:
+
+This toggle indicates whether unprivileged users are prevented
+from using dprio(2) to execute deferred set priority requests.
+When dprio_privileged is set to (0) there are no restrictions.
+When dprio_privileged is set set to (1), users must have CAP_DPRIO
+to use dprio(2), i.e. prctl(PR_SET_DEFERRED_SETPRIO).
+
+The kernel config option CONFIG_DEFERRED_SETPRIO_PRIVILEGED sets
+the default value of dprio_privileged.
 
 ==============================================================
 

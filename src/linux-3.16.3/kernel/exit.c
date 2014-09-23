@@ -53,6 +53,7 @@
 #include <linux/oom.h>
 #include <linux/writeback.h>
 #include <linux/shm.h>
+#include <linux/dprio.h>
 
 #include <asm/uaccess.h>
 #include <asm/unistd.h>
@@ -683,6 +684,11 @@ void do_exit(long code)
 	set_fs(USER_DS);
 
 	ptrace_event(PTRACE_EVENT_EXIT, code);
+
+	/*
+	 * No more deferred priority changes applied in __schedule for this task
+	 */
+	dprio_detach(tsk);
 
 	validate_creds_for_do_exit(tsk);
 

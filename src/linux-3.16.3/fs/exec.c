@@ -56,6 +56,7 @@
 #include <linux/pipe_fs_i.h>
 #include <linux/oom.h>
 #include <linux/compat.h>
+#include <linux/dprio.h>
 
 #include <asm/uaccess.h>
 #include <asm/mmu_context.h>
@@ -1434,6 +1435,7 @@ static int do_execve_common(struct filename *filename,
 	struct file *file;
 	struct files_struct *displaced;
 	int retval;
+	struct dprio_saved_context dprio_context;
 
 	if (IS_ERR(filename))
 		return PTR_ERR(filename);
@@ -1484,6 +1486,9 @@ static int do_execve_common(struct filename *filename,
 	if (retval)
 		goto out_unmark;
 
+	dprio_handle_request();
+	dprio_save_reset_context(&dprio_context);
+
 	bprm->argc = count(argv, MAX_ARG_STRINGS);
 	if ((retval = bprm->argc) < 0)
 		goto out;
@@ -1522,6 +1527,7 @@ static int do_execve_common(struct filename *filename,
 	putname(filename);
 	if (displaced)
 		put_files_struct(displaced);
+	dprio_free_context(&dprio_context);
 	return retval;
 
 out:
@@ -1529,6 +1535,8 @@ out:
 		acct_arg_size(bprm, 0);
 		mmput(bprm->mm);
 	}
+
+	dprio_restore_context(&dprio_context);
 
 out_unmark:
 	current->fs->in_exec = 0;

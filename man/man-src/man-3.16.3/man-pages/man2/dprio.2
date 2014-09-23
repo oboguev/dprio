@@ -1,0 +1,784 @@
+.\" Copyright (C) 2003 Free Software Foundation, Inc.
+.\" This file is distributed according to the GNU General Public License.
+.\" See the file COPYING in the top level source directory for details.
+.\"
+.\" Written by Sergey Oboguev.
+.TH DPRIO 2 2014-09-05 "Linux" "Linux Programmer's Manual"
+.SH NAME
+dprio \- Deferred Set Task Priority
+.SH "DESCRIPTION"
+
+.BR dprio
+is a facility to reduce the computational
+cost of frequently-repeated
+.BR sched_setattr (2)
+system calls, intended for use by applications
+that frequently execute this call.
+
+Applications relying on fine-grain parallelism
+may sometimes need to change their threads
+priority at a very high rate, hundreds or even
+thousands of times per typical scheduling
+timeslice. These are typically applications that
+have to execute short or very short lock-holding
+critical or otherwise time-urgent sections of
+code at a very high frequency and need to protect
+these sections with "set priority" system calls,
+one "set priority" call to elevate current thread
+priority before entering the critical or
+time-urgent section, followed by another call to
+downgrade thread priority at the completion of
+the section.
+
+Due to the high frequency of entering and leaving
+critical or time-urgent sections, the cost of
+these "set priority" system calls may raise to a
+noticeable part of an application's overall
+expended CPU time.
+
+.BR dprio
+allows to largely eliminate the overhead of
+these system calls.
+
+Instead of executing a system call to elevate its
+thread priority, an application simply writes its
+desired priority level to a designated memory
+area in the userspace. When the kernel attempts
+to preempt the thread, it first checks the
+content of this area, and if the application's
+posted a request to change its priority
+into the designated memory area, the
+kernel will execute this request and alter the
+priority of the thread being preempted before
+performing a rescheduling, and then make
+scheduling decisions based on the new thread
+priority level thus implementing the priority
+protection of the critical or time-urgent section
+desired by the application.
+
+In a predominant number of cases however, an
+application will complete the critical section
+before the end of the current timeslice and
+cancel or alter the request held in the userspace
+area. Thus a vast majority of an application's
+change priority requests will be handled and
+mutually cancelled or coalesced within the
+userspace, at a very low overhead and without
+incurring the cost of a system call, while
+maintaining safe preemption control. The cost of
+an actual kernel-level "set priority" operation
+is incurred only if an application is actually
+being preempted while inside the critical
+section, i.e. typically at most once per
+scheduling timeslice instead of hundreds or
+thousands "set priority" system calls in the same
+timeslice.
+
+Application developers normally would not
+interface to 
+.BR dprio
+directly and would rather use
+a user-level library simplifying the use of the
+.BR dprio
+facility and shielding an application
+developer from having to bother about low-level
+details and reimplementing the boilerplate code
+likely to be common and repetitive for all
+applications using the deferred set priority
+mechanism.
+
+Below description of
+.BR dprio
+low-level interface is
+thus of interest mostly to library and kernel
+developers.
+
+.BR dprio
+facility consists of two parts.
+
+One is the interface exposed via
+.BR prctl (2)
+with the option
+.BR PR_SET_DEFERRED_SETPRIO.
+It is used to set up the communication protocol
+between the kernel and an area in an
+application's memory space, as designated by the
+application.
+It is also used to terminate the protocol.
+
+The other part is
+.BR dprio
+userspace <-> kernel
+protocol itself, as described further below.
+
+
+.SH DPRIO PRCTL INTERFACE
+
+.BR prctl (2)
+called with option
+.BR PR_SET_DEFERRED_SETPRIO
+has two forms: one to
+set up the use of deferred set priority facility
+for the current thread, another to terminate the
+use of 
+.BR dprio
+for the thread.
+
+The system call to set up the use of 
+.BR dprio
+for the thread takes the form
+
+    prctl(PR_SET_DEFERRED_SETPRIO,
+          dprio_ku_area_pp,
+          sched_attrs_pp,
+          sched_attrs_count,
+          0)
+
+The effect of this call is limited to the current
+thread only.
+
+\fIsched_attrs_pp\fP is a pointer to an array of
+pointers to struct sched_attr (see
+.BR sched_attr (2)). 
+The array size is specified by
+parameter \fIsched_attrs_count\fP. The array describes
+a set of priorities (scheduling attributes) the
+thread intends to subsequently request via
+.BR dprio
+mechanism and must contain at least one entry per
+each scheduling policy (
+.BR SCHED_NORMAL,
+.BR SCHED_RR
+etc.) that the application intends to
+subsequently request via
+.BR dprio.
+Application can
+specify multiple entries per scheduling policy in
+the array, but only the entry with the highest
+("best") priority for the given scheduling policy
+really matters. For each of the scheduling
+policies listed in the array,
+.BR prctl(PR_SET_DEFERRED_SETPRIO)
+will determine the
+highest level of priority listed and verify
+whether the calling thread is currently
+authorized to use this level of priority. If the
+thread is not authorized to use this priority,
+.BR prctl
+call will return error status. If yes,
+.BR prctl(PR_SET_DEFERRED_SETPRIO)
+will store inside
+the kernel a pre-authorization for the thread to
+subsequently elevate to this level of priority
+via
+.BR dprio.
+.BR dprio
+will also allow the thread to
+elevate to recorded priority level and also lower
+levels of priority within the same scheduling
+policy.
+
+The following scheduling policies can be listed
+via \fIsched_attrs_pp\fP and subsequently used via
+.BR dprio:
+.BR SCHED_NORMAL,
+.BR SCHED_IDLE,
+.BR SCHED_BATCH,
+.BR SCHED_RR
+and
+.BR SCHED_FIFO.
+In most use cases an
+application would use
+.BR SCHED_FIFO 
+and/or
+.BR SCHED_RR,
+although there are marginal use cases for other
+listed classes as well.
+.BR SCHED_DEADLINE
+is not a
+meaningful policy for use cases that
+.BR dprio
+is
+intended for, and cannot be used with
+.BR dprio.
+An attempt to specify
+.BR SCHED_DEADLINE
+in
+\fIsched_attrs_pp\fP will result in
+.BR prctl(PR_SET_DEFERRED_SETPRIO)
+returning an error.
+
+More specifically, stored pre-authorization
+consists of:
+
+(a) For each scheduling policy listed in
+\fIsched_attrs_pp\fP, the highest priority level
+requested for this policy in \fIsched_attrs_pp\fP.
+
+(b) A record of whether the caller had
+.BR CAP_SYS_NICE
+capability (either explicitly
+assigned as a capability or caller having
+effective id of root) at the time of the call.
+
+If at any time after executing
+.BR prctl(PR_SET_DEFERRED_SETPRIO)
+thread priority
+limits are subsequently constrained with
+.BR prlimit/setrlimit(RLIMIT_RTPRIO)
+or
+.BR prlimit/setrlimit(RLIMIT_NICE),
+new constraint
+will affect the stored pre-authorization.
+.BR dprio
+will not allow the thread to elevate its priority
+above the new limits set by
+.BR prlimit/setrlimit(RLIMIT_RTPRIO)
+and
+.BR prlimit/setrlimit(RLIMIT_NICE)
+regardless of the
+pre-authorization created at the time of
+.BR prctl(PR_SET_DEFERRED_SETPRIO),
+unless the pre-authorization record also indicates that the
+thread had
+.BR CAP_SYS_NICE
+capability at the time of
+calling
+.BR PR_SET_DEFERRED_SETPRIO.
+This restriction
+is intended to let external process management
+applications to clamp down the application's
+priority.
+
+Thus calling
+.BR PR_SET_DEFERRED_SETPRIO
+creates a
+limited pre-authorization context separate from
+the thread's current security context and holding
+a record of
+.BR CAP_SYS_NICE
+setting for the thread
+of at the time of
+.BR PR_SET_DEFERRED_SETPRIO
+call.
+If the thread decides to subsequently downgrade
+its current security context and does not want
+the code subsequent to this point to be able to
+make use of
+.BR CAP_SYS_NICE
+recorded in the
+.BR dprio
+context, it is responsible for shutting down the
+registered
+.BR dprio
+as well.
+
+\fIdprio_ku_area_pp\fP is a pointer to u64 variable in
+the userspace, let us name the latter
+\fIdprio_ku_area_p\fP. This latter variable must be
+aligned on u64 natural boundary, i.e. on the
+8-byte boundary. When the application wants to
+signal to the kernel its desire to change the
+thread's priority, the application fills in the
+desired priority settings and control data into
+struct dprio_ku_area described below and stores
+the address of the prepared struct dprio_ku_area
+into \fIdprio_ku_area_p\fP. Even though \fIdprio_ku_area_p\fP
+actually holds a pointer, it is declared as u64,
+so the interface will be uniform regardless of
+the system's bitness, and thus 32-bit
+applications could interoperate with 64-bit
+kernel. On 32-bit systems, the upper part of
+\fIdprio_ku_area_p\fP is left zero.
+
+.BR prctl(PR_SET_DEFERRED_SETPRIO)
+stores the value
+of \fIdprio_ku_area_pp\fP inside the kernel. When the
+kernel subsequently attempts to preempt the
+thread, it checks the stored value of
+\fIdprio_ku_area_pp\fP, and if it not NULL, tries to
+fetch from the userspace a u64 value pointed to
+by \fIdprio_ku_area_pp\fP, i.e. \fIdprio_ku_area_p\fP. If the
+fetch attempt fails (either because
+\fIdprio_ku_area_pp\fP points to an invalid memory or
+page has been paged out), the kernel ignores the
+.BR dprio
+setting and proceeds as if the thread was
+not set up for
+.BR dprio.
+If the fetched value of
+\fIdprio_ku_area_p\fP is NULL, there is no
+.BR dprio
+request from the application and the kernel
+proceeds with rescheduling. If the fetched value
+of \fIdprio_ku_area_p\fP is not NULL, the kernel
+fetches struct dprio_ku_area pointed by
+\fIdprio_ku_area_p\fP. This area has the following
+structure defined by <linux/dprio_api.h>:
+.nf
+
+    #include <linux/dprio_api.h>
+
+    struct dprio_ku_area {
+    	    __dprio_volatile __u32 resp;      /* DPRIO_RESP_xxx */
+	    __dprio_volatile __u32 error;     /* one of errno values */
+	    __dprio_volatile struct sched_attr sched_attr;
+    };
+
+.fi
+The value of __dprio_volatile may be controlled by the
+application including <linux/dprio_api.h> depending on
+the method of access to the structure utilized by the application.
+Application may define __dprio_volatile to be
+.BR volatile
+or it may leave it empty and utilize compiler barriers instead.
+
+If the new priority setting requested by the
+application in sched_attr field fits within the
+pre-authorization stored for the thread during
+.BR prctl(PR_SET_DEFERRED_SETPRIO),
+the kernel will
+alter the thread's priority and scheduling
+attributes to the new value requested in
+sched_attr.
+
+The kernel will try to store the success/error
+status of the operation in resp and error fields
+and attempt to reset the value of \fIdprio_ku_area_p\fP
+to NULL. The exact kernel <-> userspace
+.BR dprio
+communication protocol is described in a separate
+section below.
+
+The system call to terminate the use of
+.BR dprio
+for the thread takes the form
+
+    prctl(PR_SET_DEFERRED_SETPRIO, 0, 0, 0, 0)
+
+After executing this call, the kernel will clear
+any previously stored value of \fIdprio_ku_area_pp\fP
+for the thread and will no longer attempt to
+check for
+.BR dprio
+requests for the thread.
+
+It is crucial that the user of
+.BR dprio
+facility remembers to detach from
+.BR dprio
+after stopping to
+use it and before relinquishing the ownership of
+memory areas pointed by \fIdprio_ku_area_pp\fP and the
+pointer stored in \fIdprio_ku_area_pp\fP, as the kernel
+will continue reading from and writing to these
+areas of memory until
+.BR dprio
+use is terminated
+either via
+.BR prctl (2)
+or thread termination.
+Therefore relinquishing the ownership of these
+memory areas prior to terminating their
+designation for
+.BR dprio
+will likely result in (1)
+task memory corruption and (2) the possibility of
+unintended task priority changes. The use of
+.BR dprio
+for the thread terminates automatically if
+the thread terminates.
+
+Right before detaching the thread from the
+previously designated \fIdprio_ku_area_pp\fP the kernel
+will make one last attempt to check for a pending
+.BR dprio
+request associated with the previous value
+of \fIdprio_ku_area_pp\fP and process any currently
+pending
+.BR dprio
+request pointed to by this value.
+
+Likewise, if the application calls
+
+    prctl(PR_SET_DEFERRED_SETPRIO, dprio_ku_area_1_pp, ...)
+    . . . . .
+    prctl(PR_SET_DEFERRED_SETPRIO, dprio_ku_area_2_pp, ...)
+
+then right before switching over to
+\fIdprio_ku_area_2_pp\fP, the kernel will process a
+pending
+.BR dprio
+request pointed by \fIdprio_ku_area_1_pp\fP.
+
+.BR dprio
+requests are handled both on voluntary and
+involuntary preemption of the thread, i.e. if the
+thread has a
+.BR dprio
+request posted, the request
+will be handled when the thread is preempted by a
+higher-priority task or on a round-robin basis,
+but also when the thread enters wait state, e.g.
+by calling sleep(3) or trying to read from a
+socket with no data available or doing epoll etc.
+
+.BR PR_SET_DEFERRED_SETPRIO
+setting is per-thread and
+is not inherited by child threads or processes
+created via
+.BR clone (2)
+or
+.BR fork (2).
+Only the effects
+of priority change requests issued via
+.BR dprio
+prior to
+.BR clone (2)
+or
+.BR fork (2)
+have an effect on a
+child task or thread (as long as this is not
+restricted by
+.BR SCHED_RESET_ON_FORK
+or
+.BR SCHED_FLAG_RESET_ON_FORK),
+but a child task or
+thread does not inherit the parent's
+.BR PR_SET_DEFERRED_SETPRIO
+setting.
+
+.BR PR_SET_DEFERRED_SETPRIO
+setting is reset by
+.BR execve (2).
+Only the effects of priority change
+requests issued via
+.BR dprio
+prior to
+.BR execve (2)
+have an effect on the loaded executable image, but a
+new image executed by the task does not inherit
+.BR PR_SET_DEFERRED_SETPRIO
+setting.
+
+When executing
+.BR clone (2),
+.BR fork (2)
+or
+.BR execve (2)
+the kernel will check for a pending
+.BR dprio
+request and
+try to process it before executing the main
+syscall body, so the effects of priority
+adjustment request posted via
+.BR dprio
+will be
+integrated in the outcome of the mentioned
+syscalls.
+
+When executing a
+.BR dprio
+request, the kernel will
+try to merge
+.BR SCHED_FLAG_RESET_ON_FORK
+into the
+current task state, as follows.
+
+If the task does not have the
+.BR SCHED_RESET_ON_FORK
+flag set, and the request does have the
+.BR SCHED_FLAG_RESET_ON_FORK
+flag set in sched_attr
+structure, the kernel will set the
+.BR SCHED_RESET_ON_FORK
+flag for the task.
+
+If the task already has the
+.BR SCHED_RESET_ON_FORK
+flag set, but the request does not have the
+.BR SCHED_FLAG_RESET_ON_FORK
+flag set in sched_attr
+structure, the task will retain the flag.
+
+The resultant task's "reset on fork" flag state
+is the logical "OR" of the preceding task's flag
+state and the
+.BR SCHED_FLAG_RESET_ON_FORK
+flag state
+in the request. If the flag in the request is not
+set, the kernel will not attempt to reset the
+task's flag.
+
+.SH DPRIO AUTHORIZATION
+
+.BR dprio
+is an optional facility and may be present
+in the system or not depending on the system build
+options.
+
+System administrator may also designate
+.BR dprio
+as
+requiring CAP_DPRIO capability to use it.
+Privileged or non-privileged status of
+.BR dprio
+can
+be specified at system build time and then
+dynamically altered by system administrator via
+\fI/proc/sys/kernel/dprio_privileged\fP or
+\fIsysctl kernel.dprio_privileged\fP.
+
+.SH DPRIO PRCTL ERRORS
+
+.BR prctl(PR_SET_DEFERRED_SETPRIO)
+may return the following errors:
+
+.B
+EINVAL
+This system does not support
+.BR dprio,
+or one
+of the entries in \fIsched_attrs_pp\fP array lists an
+unsupported scheduling policy, or a reserved
+.BR prctl (2)
+argument is not specified as 0, or
+\fIdprio_ku_area_pp\fP does not point location that is
+readable, writable and aligned on 8-byte
+boundary.
+
+.B EPERM
+Thread is not authorized to use a priority
+setting it has listed in \fIsched_attrs_pp\fP array.
+
+.B EFAULT
+One of the parameters points outside of
+accessible address space.
+
+.B E2BIG
+One of struct sched_setattr structures
+pointed from \fIsched_attrs_pp\fP array is malformatted.
+
+.B ENOMEM
+The system is out of memory and cannot
+allocate a pre-authorization context.
+
+.SH DPRIO USERSPACE <-> KERNEL PROTOCOL
+
+Userspace <-> kernel can be used after
+.BR dprio
+userspace <-> kernel is established with
+.BR prctl(PR_SET_DEFERRED_SETPRIO).
+
+.BR dprio
+protocol is defined as
+follows.
+
+To post a deferred set priority request,
+userspace performs:
+
+    Select and fill-in dprio_ku_area:
+
+        Set \fIresp\fP = DPRIO_RESP_NONE.
+        Set \fIsched_attr\fP.
+
+    Set \fIdprio_ku_area_p\fP to point struct dprio_ku_area.
+
+Kernel:
+
+.TP
+1)
+On task preemption attempt or at another
+processing point, such as fork or exec, read
+\fIdprio_ku_area_p\fP. If \fIdprio_ku_area_p\fP is not
+readable
+(inaccessible incl. page swapped out),
+quit.
+
+Note: will reattempt again on next
+preemption cycle.
+
+.TP
+2)
+If read-in value of \fIdprio_ku_area_p\fP is 0,
+do nothing and quit.
+
+.TP
+3)
+Set \fIresp\fP = DPRIO_RESP_UNKNOWN.
+.IP
+If cannot (e.g. \fIresp\fP inaccessible), quit.
+
+.TP
+4)
+Set \fIdprio_ku_area_p\fP = NULL.
+.IP
+If cannot (e.g. inaccessible), quit.
+.IP
+Note that in this case request handling
+will be reattempted on next
+thread preemption cycle. Thus \fIresp\fP value
+of DPRIO_RESP_UNKNOWN may
+be transient and overwritten with
+DPRIO_RESP_OK or DPRIO_RESP_ERROR
+if \fIdprio_ku_area_p\fP is not reset to 0 by
+the kernel (or to 0 or to
+the address of another dprio_ku_area by
+the userspace).
+
+.TP
+5)
+Read \fIsched_attr\fP.
+.IP
+If cannot (e.g. inaccessible), quit.
+
+.TP
+6)
+Try to change task scheduling attributes
+in accordance with read-in
+value of \fIsched_attr\fP.
+
+.TP
+7)
+If successful, set \fIresp\fP = DPRIO_RESP_OK
+and quit.
+
+.TP
+8)
+If unsuccessful, set \fIerror\fP = appopriate
+errno-style value.
+.IP
+If cannot (e.g. \fIerror\fP inaccessible), quit.
+.IP
+Set \fIresp\fP = DPRIO_RESP_ERROR.
+.IP
+If cannot (e.g. \fIresp\fP inaccessible), quit.
+
+.P
+Explanation of possible \fIresp\fP codes:
+
+.TP
+DPRIO_RESP_NONE
+Request has not been processed yet.
+
+.TP
+DPRIO_RESP_OK
+Request has been successfully processed.
+
+.TP
+DPRIO_RESP_ERROR
+Request has failed, \fIerror\fP has errno-style
+error code.
+
+\fIerror\fP is set to EPERM if application
+requested priority setting out of bounds of its
+pre-authorization context created with
+.BR prctl(PR_SET_DEFERRED_SETPRIO),
+or if
+pre-authorization context has been reduced with
+.BR prlimit (2)
+/
+.BR setrlimit (2)
+to lower levels.
+
+\fIerror\fP is set to EINVAL if application
+specified a malformatted value of \fIsched_attr\fP in
+.BR dprio
+request.
+
+.TP
+DPRIO_RESP_UNKNOWN
+
+Request processing has been attempted, but
+the outcome is unknown.
+Request might have been successful or failed.
+Current kernel-level thread priority becomes
+unknown.
+
+\fIerror\fP field may be invalid.
+
+This code is written to \fIresp\fP at the start of
+request processing,
+then \fIresp\fP is changed to DPRIO_RESP_OK or DPRIO_RESP_ERROR at the end
+of request processing
+if dprio_ku_area and \fIcmd\fP stay accessible for
+writing.
+
+This status code is never left visible to the
+userspace code in the
+current thread if dprio_ku_area and \fIcmd\fP are
+locked in memory and remain
+properly accessible for read and write during
+request processing.
+
+This status code might happen (i.e. stay
+visible to userspace code
+in the current thread) if access to
+dprio_ku_area or \fIcmd\fP is lost
+during request processing, for example the
+page that contains the area
+gets swapped out or the area is otherwise not
+fully accessible for
+reading and writing.
+
+If \fIerror\fP has value of DPRIO_RESP_UNKNOWN and
+\fIcmd\fP is still pointing
+to dprio_ku_area containing \fIerror\fP, it is
+possible for the request to
+be reprocessed again at the next context
+switch and \fIerror\fP change to
+DPRIO_RESP_OK or DPRIO_RESP_ERROR at this point. To ensure
+\fIerror\fP does not change
+under your feet, change \fIcmd\fP to either NULL
+or to an address of another
+dprio_ku_area distinct from one containing
+this \fIerror\fP.
+
+.P
+If userspace memory containing \fIdprio_ku_area_p\fP or
+struct dprio_ku_area gets paged out, the kernel
+won't be able to process a pending
+.BR dprio
+request
+or report processing status back to the
+userspace. In practice, the probability of this
+is exceedingly small since if the request is
+still pending, it must have been posted by the
+application during the latest timeslice, and thus
+the application must have touched those memory
+pages during this timeslice, therefore they are
+extremely likely to still be resident. The
+mainline use case for
+.BR dprio
+is to avoid performance degradation caused by problems like
+lock holder preemption, or preemption of a thread
+in overall application-urgent section. These use
+cases are tolerant to occasionally missing thread
+priority elevation as long as it is very
+infrequent, and thus the total impact on the
+performance is negligible due to very low
+incidence of such events. If the application
+requires hard guarantees, it must lock pages
+holding \fIdprio_ku_area_p\fP and struct dprio_ku_area
+in memory with
+.BR mlock (2).
+
+.SH VERSIONS
+.BR dprio
+first appeared in Linux 3.16.4.
+
+.SH CONFORMING TO
+
+.BR dprio
+is Linux-specific and should not be used in programs that are intended to be portable.
+
+.SH AUTHOR
+Sergey Oboguev <oboguev@yahoo.com>
+
+.SH SEE ALSO
+
+.BR prctl (2),
+.BR sched_setattr (2),
+.BR prlimit (2),
+.BR setrlimit (2)
+

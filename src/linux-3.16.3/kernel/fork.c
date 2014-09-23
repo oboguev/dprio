@@ -74,6 +74,7 @@
 #include <linux/uprobes.h>
 #include <linux/aio.h>
 #include <linux/compiler.h>
+#include <linux/dprio.h>
 
 #include <asm/pgtable.h>
 #include <asm/pgalloc.h>
@@ -234,7 +235,7 @@ static inline void put_signal_struct(struct signal_struct *sig)
 		free_signal_struct(sig);
 }
 
-void __put_task_struct(struct task_struct *tsk)
+static inline void __do_put_task_struct(struct task_struct *tsk)
 {
 	WARN_ON(!tsk->exit_state);
 	WARN_ON(atomic_read(&tsk->usage));
@@ -248,6 +249,84 @@ void __put_task_struct(struct task_struct *tsk)
 
 	if (!profile_handoff_task(tsk))
 		free_task(tsk);
+}
+
+#ifdef CONFIG_PUT_TASK_TIMEBOUND
+/*
+ * If timebound, use preallocated struct work_struct always guaranteed
+ * to be available, even if atomic kmalloc pool is depleted.
+ */
+static inline struct work_struct *alloc_put_task_work(struct task_struct *tsk)
+{
+	return &tsk->put_task_work;
+}
+
+static inline void free_put_task_work(struct work_struct *work)
+{
+}
+
+static inline struct task_struct *put_task_work_tsk(struct work_struct *work)
+{
+	return container_of(work, struct task_struct, put_task_work);
+}
+#else
+struct put_task_work {
+	struct work_struct work;
+	struct task_struct *tsk;
+};
+
+static inline struct work_struct *alloc_put_task_work(struct task_struct *tsk)
+{
+	struct put_task_work *dwork =
+		kmalloc(sizeof(*dwork), GFP_NOWAIT | __GFP_NOWARN);
+	if (unlikely(!dwork))
+		return NULL;
+	dwork->tsk = tsk;
+	return &dwork->work;
+}
+
+static inline void free_put_task_work(struct work_struct *work)
+{
+	struct put_task_work *dwork =
+		container_of(work, struct put_task_work, work);
+	kfree(dwork);
+}
+
+static inline struct task_struct *put_task_work_tsk(struct work_struct *work)
+{
+	struct put_task_work *dwork =
+		container_of(work, struct put_task_work, work);
+	return dwork->tsk;
+}
+#endif
+
+#ifdef CONFIG_DEFERRED_SETPRIO
+static void __put_task_struct_work(struct work_struct *work)
+{
+	__do_put_task_struct(put_task_work_tsk(work));
+	free_put_task_work(work);
+}
+#endif
+
+void __put_task_struct(struct task_struct *tsk)
+{
+#ifdef CONFIG_DEFERRED_SETPRIO
+	/*
+	 * When called from inside of __schedule(), try to defer processing
+	 * to a worker thread, in order to mininize the scheduling latency
+	 * and make it deterministic.
+	 */
+	if (unlikely(preempt_count() & PREEMPT_ACTIVE)) {
+		struct work_struct *work = alloc_put_task_work(tsk);
+
+		if (likely(work)) {
+			INIT_WORK(work, __put_task_struct_work);
+			schedule_work(work);
+			return;
+		}
+	}
+#endif
+	__do_put_task_struct(tsk);
 }
 EXPORT_SYMBOL_GPL(__put_task_struct);
 
@@ -313,6 +392,8 @@ static struct task_struct *dup_task_struct(struct task_struct *orig)
 	err = arch_dup_task_struct(tsk, orig);
 	if (err)
 		goto free_ti;
+
+	dprio_dup_task_struct(tsk);
 
 	tsk->stack = ti;
 
@@ -1581,6 +1662,11 @@ long do_fork(unsigned long clone_flags,
 	struct task_struct *p;
 	int trace = 0;
 	long nr;
+
+	/*
+	 * Process pending "deferred set priority" request.
+	 */
+	dprio_handle_request();
 
 	/*
 	 * Determine whether and which event to report to ptracer.  When

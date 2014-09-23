@@ -351,8 +351,11 @@ struct vfs_cap_data {
 
 #define CAP_AUDIT_READ		37
 
+/* Allow the use of deferred set priority (PR_SET_DEFERRED_SETPRIO) */
 
-#define CAP_LAST_CAP         CAP_AUDIT_READ
+#define CAP_DPRIO	     38
+
+#define CAP_LAST_CAP         CAP_DPRIO
 
 #define cap_valid(x) ((x) >= 0 && (x) <= CAP_LAST_CAP)
 

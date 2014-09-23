@@ -74,6 +74,7 @@
 #include <linux/binfmts.h>
 #include <linux/context_tracking.h>
 #include <linux/compiler.h>
+#include <linux/dprio.h>
 
 #include <asm/switch_to.h>
 #include <asm/tlb.h>
@@ -2691,6 +2692,111 @@ again:
 	BUG(); /* the idle class will always have a runnable task */
 }
 
+#ifdef CONFIG_DEFERRED_SETPRIO
+
+/*
+ * __schedule should never be reentered recursively while it is handling
+ * deferred change priority request in dprio_set_schedattr, i.e. when
+ * @prev->in_dprio is true.
+ *
+ * To prevent reenterancy, dprio_handle_request(...) keeps preemption
+ * disable counter non-zero and also sets PREEMPT_ACTIVE flag.
+ */
+static __always_inline bool dprio_sched_recursion(struct task_struct *prev)
+{
+#ifdef CONFIG_DEBUG_DEFERRED_SETPRIO
+	if (unlikely(prev->in_dprio)) {
+		WARN_ONCE(1, KERN_ERR "BUG: dprio recursion in __schedule\n");
+
+		prev->state = TASK_RUNNING;
+		clear_tsk_need_resched(prev);
+		clear_preempt_need_resched();
+		sched_preempt_enable_no_resched();
+
+		return true;
+	}
+#endif /* CONFIG_DEBUG_DEFERRED_SETPRIO */
+
+	return false;
+}
+
+/*
+ * Check if deferred change priority request from the userland is pending
+ * and if so, handle it.
+ *
+ *     Academically speaking, it would be desirable (instead of calling
+ *     dprio_set_schedattr *before* pick_next_task) to call it *after*
+ *     pick_next_task and only if (next != prev). However in practice this
+ *     would save at most one sched_setattr call per task scheduling interval
+ *     (only for the tasks that use dprio), and then only sometimes, only when
+ *     both dprio request is pending at rescheduling time and the task gets
+ *     actually preempted by another task. At typical values of Linux scheduling
+ *     parameters and the cost of sched_setattr call this translates to an
+ *     additional possible saving for dprio tasks that is well under 0.1%,
+ *     and probably much lower.
+ *
+ *     Nevertheless if dprio_set_schedattr were ever to be moved after the call
+ *     to pick_next_task, existing class schedulers would need to be revised
+ *     to support, in addition to call sequence
+ *
+ *       [pick_next_task] [context_switch]
+ *
+ *     also the sequence
+ *
+ *       [pick_next_task] [unlock rq] [...] [lock rq] [pick_next_task] [context_switch]
+ *
+ *     where [...] may include a bunch of intervening class scheduler method
+ *     calls local CPU and other CPUs, since we'd be giving up the rq lock.
+ *     This would require splitting pick_next_task into "prepare" and
+ *     "commit/abort" phases.
+ */
+static __always_inline void dprio_sched_handle_request(struct task_struct *prev)
+{
+	if (unlikely(prev->dprio_ku_area_pp != NULL) &&
+	    unlikely(dprio_check_for_request(prev))) {
+		int sv_pc;
+
+		/*
+		 * Do not attempt to process "deferred set priority" request for
+		 * TASK_DEAD, STOPPED, TRACED and other states where it won't be
+		 * appropriate.
+		 */
+		switch (prev->state) {
+		case TASK_RUNNING:
+		case TASK_INTERRUPTIBLE:
+		case TASK_UNINTERRUPTIBLE:
+			break;
+		default:
+			return;
+		}
+
+		sv_pc = preempt_count();
+		if (!(sv_pc & PREEMPT_ACTIVE))
+			__preempt_count_add(PREEMPT_ACTIVE);
+		set_task_in_dprio(prev, true);
+		/*
+		 * Keep preemption disabled to avoid __schedule() recursion.
+		 * In addition PREEMPT_ACTIVE notifies dprio_handle_request()
+		 * and routines that may be called from inside of it, such as
+		 * __put_task_struct(), of the calling context.
+		 */
+		dprio_handle_request();
+
+		set_task_in_dprio(prev, false);
+		if (!(sv_pc & PREEMPT_ACTIVE))
+			__preempt_count_sub(PREEMPT_ACTIVE);
+	}
+}
+#else  /* !defined CONFIG_DEFERRED_SETPRIO */
+
+static __always_inline bool dprio_sched_recursion(struct task_struct *prev)
+	{ return false; }
+
+static __always_inline void dprio_sched_handle_request(struct task_struct *prev)
+	{}
+
+#endif  /* CONFIG_DEFERRED_SETPRIO */
+
 /*
  * __schedule() is the main scheduler function.
  *
@@ -2743,6 +2849,10 @@ need_resched:
 	prev = rq->curr;
 
 	schedule_debug(prev);
+
+	if (dprio_sched_recursion(prev))
+		return;
+	dprio_sched_handle_request(prev);
 
 	if (sched_feat(HRTICK))
 		hrtick_clear(rq);
@@ -3317,9 +3427,31 @@ static bool check_same_owner(struct task_struct *p)
 	return match;
 }
 
+/*
+ * Flags for _sched_setscheduler and __sched_setscheduler:
+ *
+ *     SCHEDOP_KERNEL		on behalf of the kernel
+ *     SCHEDOP_USER		on behalf of the userspace
+ *
+ *     SCHEDOP_PRECHECK_ONLY	precheck security only, do not
+ *				actually change priority
+ *     SCHEDOP_PRECHECKED	security has been prechecked
+ *
+ *     SCHEDOP_MERGE_RESET_ON_FORK  use logical "or" of
+ *				attr->sched_flags & SCHED_FLAG_RESET_ON_FORK
+ *				and p->sched_reset_on_fork
+ *
+ * SCHEDOP_KERNEL and SCHEDOP_USER are mutually exclusive.
+ */
+#define SCHEDOP_KERNEL			(1 << 0)
+#define SCHEDOP_USER			(1 << 1)
+#define SCHEDOP_PRECHECK_ONLY		(1 << 2)
+#define SCHEDOP_PRECHECKED		(1 << 3)
+#define SCHEDOP_MERGE_RESET_ON_FORK	(1 << 4)
+
 static int __sched_setscheduler(struct task_struct *p,
 				const struct sched_attr *attr,
-				bool user)
+				int opflags)
 {
 	int newprio = dl_policy(attr->sched_policy) ? MAX_DL_PRIO - 1 :
 		      MAX_RT_PRIO - 1 - attr->sched_priority;
@@ -3329,9 +3461,13 @@ static int __sched_setscheduler(struct task_struct *p,
 	const struct sched_class *prev_class;
 	struct rq *rq;
 	int reset_on_fork;
+	bool check_security;
 
 	/* may grab non-irq protected spin_locks */
 	BUG_ON(in_interrupt());
+
+	check_security = (opflags & SCHEDOP_USER) && !(opflags & SCHEDOP_PRECHECKED);
+
 recheck:
 	/* double check policy once rq lock held */
 	if (policy < 0) {
@@ -3339,6 +3475,8 @@ recheck:
 		policy = oldpolicy = p->policy;
 	} else {
 		reset_on_fork = !!(attr->sched_flags & SCHED_FLAG_RESET_ON_FORK);
+		if (opflags & SCHEDOP_MERGE_RESET_ON_FORK)
+			reset_on_fork |= p->sched_reset_on_fork;
 
 		if (policy != SCHED_DEADLINE &&
 				policy != SCHED_FIFO && policy != SCHED_RR &&
@@ -3365,7 +3503,7 @@ recheck:
 	/*
 	 * Allow unprivileged RT tasks to decrease priority:
 	 */
-	if (user && !capable(CAP_SYS_NICE)) {
+	if (check_security && !capable(CAP_SYS_NICE)) {
 		if (fair_policy(policy)) {
 			if (attr->sched_nice < task_nice(p) &&
 			    !can_nice(p, attr->sched_nice))
@@ -3413,7 +3551,7 @@ recheck:
 			return -EPERM;
 	}
 
-	if (user) {
+	if (check_security) {
 		retval = security_task_setscheduler(p);
 		if (retval)
 			return retval;
@@ -3448,13 +3586,17 @@ recheck:
 		if (dl_policy(policy))
 			goto change;
 
-		p->sched_reset_on_fork = reset_on_fork;
+		if (!(opflags & SCHEDOP_PRECHECK_ONLY)) {
+			if (opflags & SCHEDOP_MERGE_RESET_ON_FORK)
+				reset_on_fork |= p->sched_reset_on_fork;
+			p->sched_reset_on_fork = reset_on_fork;
+		}
 		task_rq_unlock(rq, p, &flags);
 		return 0;
 	}
 change:
 
-	if (user) {
+	if (opflags & SCHEDOP_USER) {
 #ifdef CONFIG_RT_GROUP_SCHED
 		/*
 		 * Do not allow realtime tasks into groups that have no runtime
@@ -3502,6 +3644,13 @@ change:
 		return -EBUSY;
 	}
 
+	if (opflags & SCHEDOP_PRECHECK_ONLY) {
+		task_rq_unlock(rq, p, &flags);
+		return 0;
+	}
+
+	if (opflags & SCHEDOP_MERGE_RESET_ON_FORK)
+		reset_on_fork |= p->sched_reset_on_fork;
 	p->sched_reset_on_fork = reset_on_fork;
 	oldprio = p->prio;
 
@@ -3549,7 +3698,7 @@ change:
 }
 
 static int _sched_setscheduler(struct task_struct *p, int policy,
-			       const struct sched_param *param, bool check)
+			       const struct sched_param *param, int opflags)
 {
 	struct sched_attr attr = {
 		.sched_policy   = policy,
@@ -3567,7 +3716,7 @@ static int _sched_setscheduler(struct task_struct *p, int policy,
 		attr.sched_policy = policy;
 	}
 
-	return __sched_setscheduler(p, &attr, check);
+	return __sched_setscheduler(p, &attr, opflags);
 }
 /**
  * sched_setscheduler - change the scheduling policy and/or RT priority of a thread.
@@ -3582,15 +3731,41 @@ static int _sched_setscheduler(struct task_struct *p, int policy,
 int sched_setscheduler(struct task_struct *p, int policy,
 		       const struct sched_param *param)
 {
-	return _sched_setscheduler(p, policy, param, true);
+	return _sched_setscheduler(p, policy, param, SCHEDOP_USER);
 }
 EXPORT_SYMBOL_GPL(sched_setscheduler);
 
 int sched_setattr(struct task_struct *p, const struct sched_attr *attr)
 {
-	return __sched_setscheduler(p, attr, true);
+	return __sched_setscheduler(p, attr, SCHEDOP_USER);
 }
 EXPORT_SYMBOL_GPL(sched_setattr);
+
+/*
+ * Check for security context required to execute sched_setattr,
+ * but do not execute actual task scheduler properties setting.
+ */
+int sched_setattr_precheck(struct task_struct *p, const struct sched_attr *attr)
+{
+	return __sched_setscheduler(p, attr, SCHEDOP_USER |
+					     SCHEDOP_PRECHECK_ONLY);
+}
+EXPORT_SYMBOL_GPL(sched_setattr_precheck);
+
+/*
+ * Execute sched_setattr bypassing security checks.
+ */
+int sched_setattr_prechecked(struct task_struct *p,
+			     const struct sched_attr *attr,
+			     bool merge_reset_on_fork)
+{
+	int exflags = merge_reset_on_fork ? SCHEDOP_MERGE_RESET_ON_FORK : 0;
+
+	return __sched_setscheduler(p, attr, SCHEDOP_USER |
+					     SCHEDOP_PRECHECKED |
+					     exflags);
+}
+EXPORT_SYMBOL_GPL(sched_setattr_prechecked);
 
 /**
  * sched_setscheduler_nocheck - change the scheduling policy and/or RT priority of a thread from kernelspace.
@@ -3608,7 +3783,7 @@ EXPORT_SYMBOL_GPL(sched_setattr);
 int sched_setscheduler_nocheck(struct task_struct *p, int policy,
 			       const struct sched_param *param)
 {
-	return _sched_setscheduler(p, policy, param, false);
+	return _sched_setscheduler(p, policy, param, SCHEDOP_KERNEL);
 }
 
 static int

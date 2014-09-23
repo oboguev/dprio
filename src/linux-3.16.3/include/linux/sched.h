@@ -1237,6 +1237,11 @@ struct task_struct {
 
 	int wake_cpu;
 #endif
+#ifdef CONFIG_DEFERRED_SETPRIO
+	/* try to keep @dprio_ku_area in the same cacheline as @state or
+	   @on_rq or @sched_class */
+	struct dprio_ku_area __user * __user *dprio_ku_area_pp;
+#endif
 	int on_rq;
 
 	int prio, static_prio, normal_prio;
@@ -1654,6 +1659,15 @@ struct task_struct {
 #if defined(CONFIG_BCACHE) || defined(CONFIG_BCACHE_MODULE)
 	unsigned int	sequential_io;
 	unsigned int	sequential_io_avg;
+#endif
+#ifdef CONFIG_DEFERRED_SETPRIO
+	struct dprio_info *dprio_info;
+#endif
+#ifdef CONFIG_PUT_TASK_TIMEBOUND
+	struct work_struct put_task_work;
+#endif
+#ifdef CONFIG_DEBUG_DEFERRED_SETPRIO
+	bool in_dprio;
 #endif
 };
 
@@ -2195,6 +2209,11 @@ extern int sched_setscheduler_nocheck(struct task_struct *, int,
 				      const struct sched_param *);
 extern int sched_setattr(struct task_struct *,
 			 const struct sched_attr *);
+extern int sched_setattr_precheck(struct task_struct *p,
+				  const struct sched_attr *attr);
+extern int sched_setattr_prechecked(struct task_struct *p,
+				    const struct sched_attr *attr,
+				    bool merge_reset_on_fork);
 extern struct task_struct *idle_task(int cpu);
 /**
  * is_idle_task - is the specified task an idle task?
