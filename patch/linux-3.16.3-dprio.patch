@@ -1,27 +1,27 @@
- .../Documentation/sysctl/kernel.txt                |  14 +
- {linux-3.16.3 => linux-3.16.3-dprio}/fs/exec.c     |   8 +
- .../include/linux/dprio.h                          | 129 +++++
- .../include/linux/init_task.h                      |  17 +
- .../include/linux/sched.h                          |  19 +
- .../include/uapi/linux/Kbuild                      |   1 +
- .../include/uapi/linux/capability.h                |   5 +-
- .../include/uapi/linux/dprio_api.h                 | 137 +++++
- .../include/uapi/linux/prctl.h                     |   2 +
- {linux-3.16.3 => linux-3.16.3-dprio}/init/Kconfig  |   2 +
- .../kernel/Kconfig.dprio                           |  68 +++
- {linux-3.16.3 => linux-3.16.3-dprio}/kernel/exit.c |   6 +
- {linux-3.16.3 => linux-3.16.3-dprio}/kernel/fork.c |  88 ++-
- .../kernel/sched/Makefile                          |   1 +
- .../kernel/sched/core.c                            | 195 ++++++-
- .../kernel/sched/dprio.c                           | 617 +++++++++++++++++++++
- {linux-3.16.3 => linux-3.16.3-dprio}/kernel/sys.c  |   6 +
- .../kernel/sysctl.c                                |  12 +
+ Documentation/sysctl/kernel.txt |  14 +
+ fs/exec.c                       |   8 +
+ include/linux/dprio.h           | 129 +++++++++
+ include/linux/init_task.h       |  17 ++
+ include/linux/sched.h           |  19 ++
+ include/uapi/linux/Kbuild       |   1 +
+ include/uapi/linux/capability.h |   5 +-
+ include/uapi/linux/dprio_api.h  | 137 +++++++++
+ include/uapi/linux/prctl.h      |   2 +
+ init/Kconfig                    |   2 +
+ kernel/Kconfig.dprio            |  68 +++++
+ kernel/exit.c                   |   6 +
+ kernel/fork.c                   |  88 +++++-
+ kernel/sched/Makefile           |   1 +
+ kernel/sched/core.c             | 195 ++++++++++++-
+ kernel/sched/dprio.c            | 617 ++++++++++++++++++++++++++++++++++++++++
+ kernel/sys.c                    |   6 +
+ kernel/sysctl.c                 |  12 +
  18 files changed, 1315 insertions(+), 12 deletions(-)
 
-diff --git a/linux-3.16.3/Documentation/sysctl/kernel.txt b/linux-3.16.3-dprio/Documentation/sysctl/kernel.txt
+diff --git a/Documentation/sysctl/kernel.txt b/Documentation/sysctl/kernel.txt
 index c14374e..012cbad 100644
---- a/linux-3.16.3/Documentation/sysctl/kernel.txt
-+++ b/linux-3.16.3-dprio/Documentation/sysctl/kernel.txt
+--- a/Documentation/sysctl/kernel.txt
++++ b/Documentation/sysctl/kernel.txt
 @@ -30,6 +30,7 @@ show up in /proc/sys/kernel:
  - core_uses_pid
  - ctrl-alt-del
@@ -50,10 +50,10 @@ index c14374e..012cbad 100644
  domainname & hostname:
  
  These files can be used to set the NIS/YP domainname and the
-diff --git a/linux-3.16.3/fs/exec.c b/linux-3.16.3-dprio/fs/exec.c
+diff --git a/fs/exec.c b/fs/exec.c
 index a3d33fe..49a5547 100644
---- a/linux-3.16.3/fs/exec.c
-+++ b/linux-3.16.3-dprio/fs/exec.c
+--- a/fs/exec.c
++++ b/fs/exec.c
 @@ -56,6 +56,7 @@
  #include <linux/pipe_fs_i.h>
  #include <linux/oom.h>
@@ -97,11 +97,11 @@ index a3d33fe..49a5547 100644
  out_unmark:
  	current->fs->in_exec = 0;
  	current->in_execve = 0;
-diff --git a/linux-3.16.3-dprio/include/linux/dprio.h b/linux-3.16.3-dprio/include/linux/dprio.h
+diff --git a/include/linux/dprio.h b/include/linux/dprio.h
 new file mode 100644
 index 0000000..1119c00
 --- /dev/null
-+++ b/linux-3.16.3-dprio/include/linux/dprio.h
++++ b/include/linux/dprio.h
 @@ -0,0 +1,129 @@
 +/*
 + * include/linux/dprio.h
@@ -232,10 +232,10 @@ index 0000000..1119c00
 +
 +#endif /* _LINUX_DPRIO_H */
 +
-diff --git a/linux-3.16.3/include/linux/init_task.h b/linux-3.16.3-dprio/include/linux/init_task.h
+diff --git a/include/linux/init_task.h b/include/linux/init_task.h
 index 6df7f9f..bdc6767 100644
---- a/linux-3.16.3/include/linux/init_task.h
-+++ b/linux-3.16.3-dprio/include/linux/init_task.h
+--- a/include/linux/init_task.h
++++ b/include/linux/init_task.h
 @@ -164,6 +164,22 @@ extern struct task_group root_task_group;
  # define INIT_RT_MUTEXES(tsk)
  #endif
@@ -267,10 +267,10 @@ index 6df7f9f..bdc6767 100644
  }
  
  
-diff --git a/linux-3.16.3/include/linux/sched.h b/linux-3.16.3-dprio/include/linux/sched.h
+diff --git a/include/linux/sched.h b/include/linux/sched.h
 index 0376b05..42af7f3 100644
---- a/linux-3.16.3/include/linux/sched.h
-+++ b/linux-3.16.3-dprio/include/linux/sched.h
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
 @@ -1237,6 +1237,11 @@ struct task_struct {
  
  	int wake_cpu;
@@ -311,10 +311,10 @@ index 0376b05..42af7f3 100644
  extern struct task_struct *idle_task(int cpu);
  /**
   * is_idle_task - is the specified task an idle task?
-diff --git a/linux-3.16.3/include/uapi/linux/Kbuild b/linux-3.16.3-dprio/include/uapi/linux/Kbuild
+diff --git a/include/uapi/linux/Kbuild b/include/uapi/linux/Kbuild
 index 24e9033..b602608 100644
---- a/linux-3.16.3/include/uapi/linux/Kbuild
-+++ b/linux-3.16.3-dprio/include/uapi/linux/Kbuild
+--- a/include/uapi/linux/Kbuild
++++ b/include/uapi/linux/Kbuild
 @@ -99,6 +99,7 @@ header-y += dlmconstants.h
  header-y += dm-ioctl.h
  header-y += dm-log-userspace.h
@@ -323,10 +323,10 @@ index 24e9033..b602608 100644
  header-y += dqblk_xfs.h
  header-y += edd.h
  header-y += efs_fs_sb.h
-diff --git a/linux-3.16.3/include/uapi/linux/capability.h b/linux-3.16.3-dprio/include/uapi/linux/capability.h
+diff --git a/include/uapi/linux/capability.h b/include/uapi/linux/capability.h
 index 12c37a1..55c4bb0 100644
---- a/linux-3.16.3/include/uapi/linux/capability.h
-+++ b/linux-3.16.3-dprio/include/uapi/linux/capability.h
+--- a/include/uapi/linux/capability.h
++++ b/include/uapi/linux/capability.h
 @@ -351,8 +351,11 @@ struct vfs_cap_data {
  
  #define CAP_AUDIT_READ		37
@@ -340,11 +340,11 @@ index 12c37a1..55c4bb0 100644
  
  #define cap_valid(x) ((x) >= 0 && (x) <= CAP_LAST_CAP)
  
-diff --git a/linux-3.16.3-dprio/include/uapi/linux/dprio_api.h b/linux-3.16.3-dprio/include/uapi/linux/dprio_api.h
+diff --git a/include/uapi/linux/dprio_api.h b/include/uapi/linux/dprio_api.h
 new file mode 100644
 index 0000000..1748f40
 --- /dev/null
-+++ b/linux-3.16.3-dprio/include/uapi/linux/dprio_api.h
++++ b/include/uapi/linux/dprio_api.h
 @@ -0,0 +1,137 @@
 +/*
 + * Deferred set priority.
@@ -483,10 +483,10 @@ index 0000000..1748f40
 +
 +#endif /* _UAPI_LINUX_DPRIO_API_H */
 +
-diff --git a/linux-3.16.3/include/uapi/linux/prctl.h b/linux-3.16.3-dprio/include/uapi/linux/prctl.h
+diff --git a/include/uapi/linux/prctl.h b/include/uapi/linux/prctl.h
 index 58afc04..3513db5 100644
---- a/linux-3.16.3/include/uapi/linux/prctl.h
-+++ b/linux-3.16.3-dprio/include/uapi/linux/prctl.h
+--- a/include/uapi/linux/prctl.h
++++ b/include/uapi/linux/prctl.h
 @@ -152,4 +152,6 @@
  #define PR_SET_THP_DISABLE	41
  #define PR_GET_THP_DISABLE	42
@@ -494,21 +494,21 @@ index 58afc04..3513db5 100644
 +#define PR_SET_DEFERRED_SETPRIO	43
 +
  #endif /* _LINUX_PRCTL_H */
-diff --git a/linux-3.16.3/init/Kconfig b/linux-3.16.3-dprio/init/Kconfig
+diff --git a/init/Kconfig b/init/Kconfig
 index 9d76b99..a8faee1 100644
---- a/linux-3.16.3/init/Kconfig
-+++ b/linux-3.16.3-dprio/init/Kconfig
+--- a/init/Kconfig
++++ b/init/Kconfig
 @@ -1905,3 +1905,5 @@ config ASN1
  	  functions to call on what tags.
  
  source "kernel/Kconfig.locks"
 +source "kernel/Kconfig.dprio"
 +
-diff --git a/linux-3.16.3-dprio/kernel/Kconfig.dprio b/linux-3.16.3-dprio/kernel/Kconfig.dprio
+diff --git a/kernel/Kconfig.dprio b/kernel/Kconfig.dprio
 new file mode 100644
 index 0000000..c18f2d0
 --- /dev/null
-+++ b/linux-3.16.3-dprio/kernel/Kconfig.dprio
++++ b/kernel/Kconfig.dprio
 @@ -0,0 +1,68 @@
 +menuconfig DEFERRED_SETPRIO
 +	bool "Enable deferred setting of task priority"
@@ -578,10 +578,10 @@ index 0000000..c18f2d0
 +
 +endif # DEFERRED_SETPRIO
 +
-diff --git a/linux-3.16.3/kernel/exit.c b/linux-3.16.3-dprio/kernel/exit.c
+diff --git a/kernel/exit.c b/kernel/exit.c
 index e5c4668..a9a19dd 100644
---- a/linux-3.16.3/kernel/exit.c
-+++ b/linux-3.16.3-dprio/kernel/exit.c
+--- a/kernel/exit.c
++++ b/kernel/exit.c
 @@ -53,6 +53,7 @@
  #include <linux/oom.h>
  #include <linux/writeback.h>
@@ -602,10 +602,10 @@ index e5c4668..a9a19dd 100644
  	validate_creds_for_do_exit(tsk);
  
  	/*
-diff --git a/linux-3.16.3/kernel/fork.c b/linux-3.16.3-dprio/kernel/fork.c
+diff --git a/kernel/fork.c b/kernel/fork.c
 index 6a13c46..2d738f6 100644
---- a/linux-3.16.3/kernel/fork.c
-+++ b/linux-3.16.3-dprio/kernel/fork.c
+--- a/kernel/fork.c
++++ b/kernel/fork.c
 @@ -74,6 +74,7 @@
  #include <linux/uprobes.h>
  #include <linux/aio.h>
@@ -729,20 +729,20 @@ index 6a13c46..2d738f6 100644
  	 * Determine whether and which event to report to ptracer.  When
  	 * called from kernel_thread or CLONE_UNTRACED is explicitly
  	 * requested, no event is reported; otherwise, report if the event
-diff --git a/linux-3.16.3/kernel/sched/Makefile b/linux-3.16.3-dprio/kernel/sched/Makefile
+diff --git a/kernel/sched/Makefile b/kernel/sched/Makefile
 index ab32b7b..a93d07c 100644
---- a/linux-3.16.3/kernel/sched/Makefile
-+++ b/linux-3.16.3-dprio/kernel/sched/Makefile
+--- a/kernel/sched/Makefile
++++ b/kernel/sched/Makefile
 @@ -19,3 +19,4 @@ obj-$(CONFIG_SCHED_AUTOGROUP) += auto_group.o
  obj-$(CONFIG_SCHEDSTATS) += stats.o
  obj-$(CONFIG_SCHED_DEBUG) += debug.o
  obj-$(CONFIG_CGROUP_CPUACCT) += cpuacct.o
 +obj-$(CONFIG_DEFERRED_SETPRIO) += dprio.o
 \ No newline at end of file
-diff --git a/linux-3.16.3/kernel/sched/core.c b/linux-3.16.3-dprio/kernel/sched/core.c
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
 index 0acf96b..48616d9 100644
---- a/linux-3.16.3/kernel/sched/core.c
-+++ b/linux-3.16.3-dprio/kernel/sched/core.c
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
 @@ -74,6 +74,7 @@
  #include <linux/binfmts.h>
  #include <linux/context_tracking.h>
@@ -1054,11 +1054,11 @@ index 0acf96b..48616d9 100644
  }
  
  static int
-diff --git a/linux-3.16.3-dprio/kernel/sched/dprio.c b/linux-3.16.3-dprio/kernel/sched/dprio.c
+diff --git a/kernel/sched/dprio.c b/kernel/sched/dprio.c
 new file mode 100644
 index 0000000..94cec5f
 --- /dev/null
-+++ b/linux-3.16.3-dprio/kernel/sched/dprio.c
++++ b/kernel/sched/dprio.c
 @@ -0,0 +1,617 @@
 +/*
 + * kernel/sched/dprio.c
@@ -1677,10 +1677,10 @@ index 0000000..94cec5f
 +	return 0;
 +}
 +
-diff --git a/linux-3.16.3/kernel/sys.c b/linux-3.16.3-dprio/kernel/sys.c
+diff --git a/kernel/sys.c b/kernel/sys.c
 index 66a751e..6584f86 100644
---- a/linux-3.16.3/kernel/sys.c
-+++ b/linux-3.16.3-dprio/kernel/sys.c
+--- a/kernel/sys.c
++++ b/kernel/sys.c
 @@ -52,6 +52,7 @@
  #include <linux/rcupdate.h>
  #include <linux/uidgid.h>
@@ -1701,10 +1701,10 @@ index 66a751e..6584f86 100644
  	default:
  		error = -EINVAL;
  		break;
-diff --git a/linux-3.16.3/kernel/sysctl.c b/linux-3.16.3-dprio/kernel/sysctl.c
+diff --git a/kernel/sysctl.c b/kernel/sysctl.c
 index 75b22e2..236ad62 100644
---- a/linux-3.16.3/kernel/sysctl.c
-+++ b/linux-3.16.3-dprio/kernel/sysctl.c
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
 @@ -63,6 +63,7 @@
  #include <linux/binfmts.h>
  #include <linux/sched/sysctl.h>

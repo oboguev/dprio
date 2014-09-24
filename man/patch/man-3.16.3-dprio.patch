@@ -1,12 +1,12 @@
- /dev/null => man-pages.dprio/man2/dprio.2   | 784 ++++++++++++++++++++++++++++
- {man-pages => man-pages.dprio}/man2/prctl.2 |   5 +
+ man2/dprio.2 | 784 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ man2/prctl.2 |   5 +
  2 files changed, 789 insertions(+)
 
-diff --git a/man-pages.dprio/man2/dprio.2 b/man-pages.dprio/man2/dprio.2
+diff --git a/man2/dprio.2 b/man2/dprio.2
 new file mode 100644
 index 0000000..9d457ec
 --- /dev/null
-+++ b/man-pages.dprio/man2/dprio.2
++++ b/man2/dprio.2
 @@ -0,0 +1,784 @@
 +.\" Copyright (C) 2003 Free Software Foundation, Inc.
 +.\" This file is distributed according to the GNU General Public License.
@@ -792,10 +792,10 @@ index 0000000..9d457ec
 +.BR prlimit (2),
 +.BR setrlimit (2)
 +
-diff --git a/man-pages/man2/prctl.2 b/man-pages.dprio/man2/prctl.2
+diff --git a/man2/prctl.2 b/man2/prctl.2
 index 1199891..20b77bd 100644
---- a/man-pages/man2/prctl.2
-+++ b/man-pages.dprio/man2/prctl.2
+--- a/man2/prctl.2
++++ b/man2/prctl.2
 @@ -799,6 +799,11 @@ This should help system administrators monitor unusual
  symbolic-link transitions over all processes running on a system.
  .RE
